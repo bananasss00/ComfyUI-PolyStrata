@@ -50,6 +50,7 @@ import io
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -631,6 +632,178 @@ def update_global_vram_reservation(reserve_bytes: int) -> str:
         return f"бронь VRAM ComfyUI не удалась ({e})"
 
 
+# ================================================================ авто-выгрузка модели
+# ТАК ЖЕ, как в llama.cpp-нодах (ComfyUI-LlamaCPP-Subprocess: хуки на
+# PromptExecutor.execute и model_management.unload_all_models), только вместо kill
+# процесса - POST /v1/unload. Зачем: главная нода забайпашена / воркфлоу переключён /
+# ноды удалены - модель PolyStrata зря держит VRAM. Механика:
+#   1) нода Chat при генерации помечает свой сервер как используемый (ACTIVE_SERVERS);
+#   2) хук на PromptExecutor.execute (каждый запуск воркфлоу): серверы, которые есть в
+#      ACTIVE_SERVERS, но НЕ упомянуты живыми нодами Chat/Unload текущего воркфлоу,
+#      выгружаются автоматически (сервер-«сирота»);
+#   3) хук на model_management.unload_all_models: ComfyUI освобождает память ВНЕ
+#      выполнения нод (кнопка Free model and node cache, вытеснение) - выгружаем все
+#      наши серверы. Внутри выполнения нод (execution.py в стеке) - НЕ трогаем.
+# Сервер, к которому нодпак ни разу не обращался в этой сессии ComfyUI, НЕ выгружается
+# никогда: к нему может быть подключён другой клиент (Jan, curl, другой ComfyUI).
+# Выгрузка идёт в фоновом потоке: очередь ComfyUI не ждёт HTTP (wait до 30 c, если на
+# сервере ещё идёт генерация - она ДОРАБАТАЕТ, затем модель выгрузится).
+AUTO_UNLOAD_CLASSES = ("PolyStrataChat", "PolyStrataUnload")   # ноды с полем server
+AUTO_UNLOAD_WAIT_S = 30.0        # сколько ждать активную генерацию перед выгрузкой
+ACTIVE_SERVERS: set = set()      # нормализованные base-URL серверов этой сессии
+_AUTO_LOCK = threading.Lock()
+_AUTO_HOOKS = {"installed": False}
+
+
+def mark_server_active(server: str) -> str:
+    """Запомнить сервер как используемый нодами (вызывается из _chat_generate).
+    Возвращает нормализованный base-URL ("http://ip:порт") или "" при ошибке."""
+    try:
+        base = PolyStrataClient(str(server or ""), "").base
+    except Exception:
+        return ""
+    with _AUTO_LOCK:
+        fresh = base not in ACTIVE_SERVERS
+        ACTIVE_SERVERS.add(base)
+    if fresh:
+        print(f"[PolyStrata] авто-выгрузка: слежу за сервером {base} - выгружу его сам, "
+              f"если он исчезнет из воркфлоу (байпасс главной ноды / другой воркфлоу)",
+              flush=True)
+    return base
+
+
+def _auto_unload_server(base: str, wait_s: float = None) -> str:
+    """POST /v1/unload; ошибки - в строку для лога, наверх не летят (фоновый механизм).
+    Возвращает человекочитаемый итог: 'модель выгружена' / 'уже спит' / причина отказа."""
+    if wait_s is None:
+        wait_s = AUTO_UNLOAD_WAIT_S
+    try:
+        out = PolyStrataClient(base, "").unload(float(wait_s))
+        st = str(out.get("status", "?"))
+        if st == "unloaded":
+            return "модель выгружена полностью"
+        if st == "not loaded":
+            return "модель уже спит"
+        return f"неожиданный статус '{st}'"
+    except PolyStrataError as e:
+        return f"не удалось: {str(e)[:160]}"
+
+
+def _servers_in_prompt(prompt) -> set:
+    """Нормализованные адреса серверов из ЖИВЫХ нод Chat/Unload в промпте.
+    Забайпашенные/замьюченные ноды НЕ считаются живыми: новый фронтенд ComfyUI шлёт
+    их как class_type 'BypassedNode__<класс>' / 'MutedNode__<класс>' (точное совпадение
+    с AUTO_UNLOAD_CLASSES не пройдёт), старый фронтенд вообще не включает их в промпт."""
+    found = set()
+    if not isinstance(prompt, dict):
+        return found
+    for info in prompt.values():
+        if not isinstance(info, dict) or info.get("mode") in (2, 4):   # mute/bypass (старый фронт)
+            continue
+        if info.get("class_type") in AUTO_UNLOAD_CLASSES:
+            srv = (info.get("inputs") or {}).get("server", "")
+            if srv:
+                try:
+                    found.add(PolyStrataClient(str(srv), "").base)
+                except Exception:
+                    pass
+    return found
+
+
+def _auto_unload_for_prompt(prompt) -> list:
+    """Выгрузить серверы-«сироты»: использовались нодами раньше, но их НЕТ среди живых
+    нод текущего воркфлоу. Сервер, выгрузить который не удалось (занят), остаётся под
+    наблюдением - попытка повторится при следующем запуске воркфлоу. Возвращает лог."""
+    with _AUTO_LOCK:
+        tracked = set(ACTIVE_SERVERS)
+    if not tracked:
+        return []
+    orphans = sorted(tracked - _servers_in_prompt(prompt))
+    msgs = []
+    for base in orphans:
+        note = _auto_unload_server(base)
+        done = note.startswith(("модель выгружена", "модель уже спит"))
+        if done:
+            with _AUTO_LOCK:
+                ACTIVE_SERVERS.discard(base)
+        msgs.append(f"[PolyStrata] АВТО-ВЫГРУЗКА: сервер {base} отсутствует в текущем воркфлоу "
+                    f"(главная нода забайпашена / другой воркфлоу / ноды удалены) - {note}"
+                    + ("" if done else "; остаётся под наблюдением"))
+    if any("модель выгружена" in m for m in msgs):
+        msgs.append(f"[PolyStrata] АВТО-ВЫГРУЗКА: ComfyUI: {update_global_vram_reservation(0)}.")
+    for m in msgs:
+        print(m, flush=True)
+    return msgs
+
+
+def _auto_unload_all() -> list:
+    """Выгрузить ВСЕ серверы, использованные нодами в этой сессии (хук
+    unload_all_models: ComfyUI сам освобождает память вне выполнения нод)."""
+    with _AUTO_LOCK:
+        tracked = set(ACTIVE_SERVERS)
+    msgs = []
+    for base in sorted(tracked):
+        note = _auto_unload_server(base)
+        if note.startswith(("модель выгружена", "модель уже спит")):
+            with _AUTO_LOCK:
+                ACTIVE_SERVERS.discard(base)
+        msgs.append(f"[PolyStrata] АВТО-ВЫГРУЗКА (ComfyUI освободил память): {base} - {note}")
+    if msgs and any("модель выгружена" in m for m in msgs):
+        msgs.append(f"[PolyStrata] АВТО-ВЫГРУЗКА: ComfyUI: {update_global_vram_reservation(0)}.")
+    for m in msgs:
+        print(m, flush=True)
+    return msgs
+
+
+def install_auto_unload_hooks() -> bool:
+    """Установить хуки - механика llama.cpp-нод (hooked_execute /
+    hooked_unload_all_models_llamacpp). Повторные вызовы безопасны; без ComfyUI False."""
+    if _AUTO_HOOKS["installed"]:
+        return True
+    try:
+        import inspect
+        import execution
+        import comfy.model_management as mm
+    except Exception as e:
+        print(f"[PolyStrata] авто-выгрузка: хуки не установлены (ComfyUI недоступен: {e})",
+              flush=True)
+        return False
+
+    if not hasattr(execution.PromptExecutor, "_orig_execute_polystrata"):
+        execution.PromptExecutor._orig_execute_polystrata = execution.PromptExecutor.execute
+
+        def _hooked_execute(self, prompt, prompt_id, *args, **kwargs):
+            try:
+                threading.Thread(target=_auto_unload_for_prompt, args=(prompt,),
+                                 daemon=True).start()   # очередь не ждёт HTTP
+            except Exception as e:
+                print(f"[PolyStrata] авто-выгрузка: ошибка хука execute ({e})", flush=True)
+            return self._orig_execute_polystrata(prompt, prompt_id, *args, **kwargs)
+
+        execution.PromptExecutor.execute = _hooked_execute
+
+    if not hasattr(mm, "_orig_unload_all_polystrata"):
+        mm._orig_unload_all_polystrata = mm.unload_all_models
+
+        def _hooked_unload_all(*args, **kwargs):
+            try:
+                stack = inspect.stack()
+                # не зацикливаться: во время выполнения нод (execution.py в стеке) не трогаем
+                is_node_execution = any("execution.py" in fr.filename for fr in stack)
+            except Exception:
+                is_node_execution = False
+            if not is_node_execution:
+                _auto_unload_all()
+            return mm._orig_unload_all_polystrata(*args, **kwargs)
+
+        mm.unload_all_models = _hooked_unload_all
+
+    _AUTO_HOOKS["installed"] = True
+    print("[PolyStrata] авто-выгрузка активна: главная нода забайпашена / открыт другой "
+          "воркфлоу - модель выгружается сама (как в llama.cpp-нодах)", flush=True)
+    return True
+
+
 # ================================================================ общее ядро Chat
 def _parse_logit_bias(text: str) -> dict:
     """Строки 'id' (бан, -100) / 'id:bias' / 'id=bias' / 'id bias' -> {'id': float}."""
@@ -710,6 +883,7 @@ def _chat_generate(server: str, api_key: str, prompt: str, system_prompt: str, m
     во время запроса сокет закрывается ПО-НАСТОЯЩЕМУ (FIN), и watch-поток PolyStrata
     (_watch_client: select + MSG_PEEK каждые 0.5 c) отменяет генерацию движка."""
     _throw_if_interrupted()                      # прервано ДО старта - сервер не дёргаем
+    mark_server_active(server)                   # авто-выгрузка: сервер под наблюдением
     store = memory if hasattr(memory, "remember") else None
     sd = dict(sampling) if isinstance(sampling, dict) else {}
 
@@ -1326,3 +1500,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PolyStrataMemory": "PolyStrata Memory",
     "PolyStrataUnload": "PolyStrata Unload (полная выгрузка)",
 }
+
+# Авто-выгрузка модели (механика llama.cpp-нод): хуки на каждый запуск воркфлоу и на
+# unload_all_models. В тестах/без ComfyUI тихо возвращается False.
+try:
+    install_auto_unload_hooks()
+except Exception as _e:
+    print(f"[PolyStrata] авто-выгрузка: не удалось установить хуки ({_e})", flush=True)
