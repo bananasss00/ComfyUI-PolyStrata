@@ -50,6 +50,7 @@ import io
 import json
 import os
 import re
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -105,6 +106,101 @@ def _throw_if_interrupted() -> None:
     fn = getattr(mm, "throw_exception_if_processing_interrupted", None)
     if fn is not None:
         fn()
+
+# ================================================================ пресеты системных промптов
+# ТАК ЖЕ, как в llama.cpp-нодах (ComfyUI-LlamaCPP-Subprocess): папка
+# ComfyUI/models/LLM/prompts, один пресет = один .txt файл (можно в подкаталогах,
+# в дропдауне виден относительный путь "subdir/prompt.txt").
+# Обновление списка: файлы сканируются КАЖДЫЙ РАЗ при построении ноды (define_schema/
+# INPUT_TYPES) - БЕЗ кеша folder_paths.get_filename_list(), который не инвалидируется при
+# ручном добавлении файлов. При обновлении вкладки браузера ComfyUI перечитывает
+# /object_info - ноды строятся заново, и дропдауны показывают актуальный список файлов.
+NO_SYSTEM_PROMPT = "none"
+PROMPT_FOLDER = "llm_text_processor_prompts"   # то же имя папки, что в llama.cpp-нодах
+
+# Стандартные пресеты - те же файлы, что создаёт llama.cpp-пак; каждый недостающий
+# файл досоздаётся при загрузке (если llama.cpp-ноды стоят рядом - всё уже существует).
+DEFAULT_PROMPTS = {
+    "prompt_refine_expand.txt": "Refine and enhance the following user prompt for creative text-to-image generation. Keep the meaning and keywords, make it more expressive and visually rich. Output ONLY the improved prompt text (no preface, no bullets, no JSON, no <think>, no commentary).",
+    "short_story.txt": "Write a short, imaginative story inspired by this image or video.",
+    "video_summary.txt": "Summarize the key events and narrative points in this video.",
+    "detailed_analysis.txt": "Output ONLY these sections with short labels (no bullets): Subject; People (if any); Environment; Lighting; Camera/Composition; Color/Texture. In each section, write 2–4 sentences of concrete visible details. If something is not visible, write 'not visible'. No preface, no reasoning, no <think>.",
+    "cinematic_description.txt": "Write ONE cinematic paragraph (8–12 sentences). Describe the scene like a film still: subject(s) and action; environment and atmosphere; lighting design (practical lights vs ambient, direction, contrast); camera language (shot type, angle, lens feel, depth of field, motion implied); composition and mood. Keep it vivid but factual (no made-up story). No preface, no reasoning, no <think>.",
+    "ultra_detailed_description.txt": "Write ONE ultra-detailed paragraph (10–16 sentences, ~180–320 words). Stay grounded in visible details. Include: subject micro-details (materials, textures, patterns, wear, reflections); people details if present (hair, skin tones, makeup, jewelry, fabric types, fit); environment depth (foreground/midground/background, signage/props, surface materials); lighting analysis (key/fill/back light, direction, softness, highlights, shadow shape); camera perspective (angle, lens feel, depth of field) and composition (leading lines, negative space, symmetry/asymmetry, visual hierarchy). No preface, no reasoning, no <think>.",
+    "detailed_description.txt": "Write ONE detailed paragraph (6–10 sentences). Describe only what is visible: subject(s) and actions; people details if present (approx age group, gender expression if clear, hair, facial expression, pose, clothing, accessories); environment (location type, background elements, time cues); lighting (source, direction, softness/hardness, color temperature, shadows); camera viewpoint (eye-level/low/high, distance) and composition (framing, focal emphasis). No preface, no reasoning, no <think>.",
+    "simple_description.txt": "Analyze the image and write a single concise sentence that describes the main subject and setting. Keep it grounded in visible details only.",
+    "tags.txt": "Your task is to generate a clean list of comma-separated tags for a text-to-image AI, based *only* on the visual information in the image. Limit the output to a maximum of 50 unique tags. Strictly describe visual elements like subject, clothing, environment, colors, lighting, and composition. Do not include abstract concepts, interpretations, marketing terms, or technical jargon (e.g., no 'SEO', 'brand-aligned', 'viral potential'). The goal is a concise list of visual descriptors. Avoid repeating tags."
+}
+
+
+def prompt_root() -> Path:
+    """Папка пресетов - ТОТ ЖЕ путь, что в llama.cpp-нодах: models/LLM/prompts."""
+    try:
+        import folder_paths
+        return Path(folder_paths.models_dir) / "LLM" / "prompts"
+    except Exception:
+        return Path(os.getcwd()) / "models" / "LLM" / "prompts"
+
+
+def _register_prompt_folder() -> None:
+    """Создать папку пресетов, недостающие стандартные пресеты и зарегистрировать
+    папку в folder_paths (то же имя и содержимое, что у llama.cpp-нод)."""
+    try:
+        d = prompt_root()
+        d.mkdir(parents=True, exist_ok=True)
+        for filename, content in DEFAULT_PROMPTS.items():
+            fp = d / filename
+            if not fp.exists():
+                try:
+                    fp.write_text(content, encoding="utf-8")
+                    print(f"[PolyStrata] создан стандартный пресет: {filename}", flush=True)
+                except Exception as e:
+                    print(f"[PolyStrata] предупреждение: не удалось создать пресет "
+                          f"{filename}. Ошибка: {e}", flush=True)
+        import folder_paths
+        folder_paths.folder_names_and_paths[PROMPT_FOLDER] = ([str(d)], {".txt"})
+    except Exception as e:
+        print(f"[PolyStrata] папка пресетов системных промптов недоступна ({e}) - "
+              f"список пресетов будет пуст (только 'none')", flush=True)
+
+
+def system_prompt_options() -> list:
+    """Свежее сканирование папки пресетов при КАЖДОМ вызове, минуя кеш folder_paths
+    (get_filename_list кеширует и не инвалидируется при ручном добавлении файлов -
+    из-за этого список не обновлялся бы при перезагрузке страницы ComfyUI).
+    Рекурсивно: в дропдауне - относительные пути ("subdir/my_prompt.txt")."""
+    d = prompt_root()
+    if not d.exists():
+        return [NO_SYSTEM_PROMPT]
+    try:
+        files = sorted(
+            str(f.relative_to(d)).replace(os.sep, "/")
+            for f in d.rglob("*.txt") if f.is_file()
+        )
+    except Exception:
+        files = []
+    return [NO_SYSTEM_PROMPT] + files
+
+
+def resolve_system_prompt(preset_name: str, manual_text: str) -> str:
+    """Логика llama.cpp-нод: выбран пресет (не 'none') - используется ТОЛЬКО он,
+    ручной текст игнорируется; 'none' - берётся ручной system_prompt_text."""
+    if preset_name and preset_name != NO_SYSTEM_PROMPT:
+        p = prompt_root() / preset_name
+        if p.is_file():
+            try:
+                return p.read_text(encoding="utf-8").strip()
+            except Exception as e:
+                print(f"[PolyStrata] пресет '{preset_name}' не прочитан: {e}", flush=True)
+                return ""
+        print(f"[PolyStrata] пресет '{preset_name}' не найден в {prompt_root()} - "
+              f"системный промпт пуст", flush=True)
+        return ""
+    return (manual_text or "").strip()
+
+
+_register_prompt_folder()
+
 
 MAX_PIN_SLOTS = 50             # autogrow: максимум пинов в группе img_* / vid_*
 MAX_IMAGES_PER_PIN = 64        # потолок кадров одного image-пина (до выборки)
@@ -803,9 +899,18 @@ if _HAS_V3:
                     comfy_io.String.Input("prompt", multiline=True,
                                           default="Опиши это видео или изображения подробно.",
                                           tooltip="Запрос к модели (роль user)."),
-                    comfy_io.String.Input("system_prompt", multiline=True, default="",
-                                          tooltip="Системный промпт (роль system). Пусто - не отправляется. "
-                                                  "Перекрывается системным промптом ноды Memory, если тот задан."),
+                    comfy_io.Combo.Input("system_prompt_preset", options=system_prompt_options(),
+                                         default=NO_SYSTEM_PROMPT,
+                                         tooltip="Пресет системного промпта из ComfyUI/models/LLM/prompts "
+                                                 "(.txt, можно в подпапках) - тот же путь, что в llama.cpp-нодах. "
+                                                 "none - без пресета. Выбранный пресет ПЕРЕКРЫВАЕТ поле "
+                                                 "system_prompt_text (но перекрывается системным промптом ноды "
+                                                 "Memory, если тот задан). Список перечитывается при каждой "
+                                                 "перезагрузке страницы ComfyUI - свежие .txt файлы видны сразу."),
+                    comfy_io.String.Input("system_prompt_text", multiline=True, default="",
+                                          tooltip="Ручной системный промпт (роль system). Используется, если "
+                                                  "пресет = none. Пусто - не отправляется. Перекрывается "
+                                                  "системным промптом ноды Memory, если тот задан."),
                     comfy_io.String.Input("model", default="",
                                           tooltip="Имя модели для поля 'model'. Пусто - не отправляется "
                                                   "(сервер использует запущенную). Имя должно совпадать с "
@@ -864,11 +969,13 @@ if _HAS_V3:
 
         @classmethod
         def execute(cls, server="127.0.0.1:8080", prompt="Опиши это видео или изображения подробно.",
-                    system_prompt="", model="", reasoning="default", max_tokens=1024,
+                    system_prompt_preset=NO_SYSTEM_PROMPT, system_prompt_text="", model="",
+                    reasoning="default", max_tokens=1024,
                     temperature=0.8, top_p=0.95, seed=0, max_frame_side=DEFAULT_FRAME_SIDE,
                     reserve_mib=0, extra_mib=0, api_key="", max_images=16, max_video_frames=8,
                     video_fps=0, images=None, videos=None, memory=None,
                     sampling=None) -> comfy_io.NodeOutput:
+            system_prompt = resolve_system_prompt(system_prompt_preset, system_prompt_text)
             text, thoughts = _chat_generate(
                 server, api_key, prompt, system_prompt, model, reasoning, max_tokens,
                 temperature, top_p, seed, reserve_mib, extra_mib, images, videos,
@@ -890,8 +997,15 @@ else:
                     "prompt": ("STRING", {"multiline": True,
                                           "default": "Опиши это видео или изображения подробно.",
                                           "tooltip": "Запрос к модели (роль user)."}),
-                    "system_prompt": ("STRING", {"multiline": True, "default": "",
-                                                 "tooltip": "Системный промпт (роль system)."}),
+                    "system_prompt_preset": (system_prompt_options(),
+                                             {"default": NO_SYSTEM_PROMPT,
+                                              "tooltip": "Пресет системного промпта из models/LLM/prompts (.txt) - "
+                                                         "тот же путь, что в llama.cpp-нодах. Выбранный пресет "
+                                                         "ПЕРЕКРЫВАЕТ system_prompt_text. Список обновляется при "
+                                                         "перезагрузке страницы ComfyUI."}),
+                    "system_prompt_text": ("STRING", {"multiline": True, "default": "",
+                                                      "tooltip": "Ручной системный промпт (роль system). "
+                                                                 "Используется, если пресет = none."}),
                     "model": ("STRING", {"default": "", "tooltip": "Имя модели; пусто = запущенная."}),
                     "reasoning": (["default", "none", "low", "medium", "high"],
                                   {"default": "default",
@@ -939,11 +1053,13 @@ else:
         FUNCTION = "generate"
         CATEGORY = "PolyStrata"
 
-        def generate(self, server, prompt, system_prompt="", model="", reasoning="default",
+        def generate(self, server, prompt, system_prompt_preset=NO_SYSTEM_PROMPT,
+                     system_prompt_text="", model="", reasoning="default",
                      max_tokens=1024, temperature=0.8, top_p=0.95, seed=0,
                      max_frame_side=DEFAULT_FRAME_SIDE, reserve_mib=0, extra_mib=0,
                      api_key="", max_images=16, max_video_frames=8, video_fps=0,
                      images=None, videos=None, memory=None, sampling=None):
+            system_prompt = resolve_system_prompt(system_prompt_preset, system_prompt_text)
             text, thoughts = _chat_generate(
                 server, api_key, prompt, system_prompt, model, reasoning, max_tokens,
                 temperature, top_p, seed, reserve_mib, extra_mib, images, videos,
@@ -1059,9 +1175,17 @@ class PolyStrataMemory:
                 "max_turns": ("INT", {"default": 10, "min": 0, "max": 500, "step": 1,
                                       "tooltip": "Сколько последних ходов (вопрос+ответ) держать в истории. "
                                                  "0 = без ограничения (следите за контекстом модели)."}),
-                "system_prompt": ("STRING", {"multiline": True, "default": "",
-                                             "tooltip": "Системный промпт этого разговора; перекрывает "
-                                                        "системный промпт ноды Chat, если задан."}),
+                "system_prompt_preset": (system_prompt_options(),
+                                         {"default": NO_SYSTEM_PROMPT,
+                                          "tooltip": "Пресет системного промпта из ComfyUI/models/LLM/prompts "
+                                                     "(.txt, можно в подпапках) - тот же путь, что в llama.cpp-нодах. "
+                                                     "none - без пресета. Выбранный пресет ПЕРЕКРЫВАЕТ поле "
+                                                     "system_prompt_text. Список обновляется при каждой перезагрузке "
+                                                     "страницы ComfyUI."}),
+                "system_prompt_text": ("STRING", {"multiline": True, "default": "",
+                                                  "tooltip": "Ручной системный промпт этого разговора; перекрывает "
+                                                             "системный промпт ноды Chat, если задан. "
+                                                             "Используется, если пресет = none."}),
                 "clear": ("BOOLEAN", {"default": False,
                                       "tooltip": "True - очистить историю в начале этого запуска (разговор "
                                                  "с чистого листа, затем запишется новый ход)."}),
@@ -1080,9 +1204,10 @@ class PolyStrataMemory:
         self._max_turns = 10
         self._system = ""
 
-    def run(self, max_turns=10, system_prompt="", clear=False):
+    def run(self, max_turns=10, system_prompt_preset=NO_SYSTEM_PROMPT, system_prompt_text="",
+            clear=False):
         self._max_turns = int(max_turns)
-        self._system = (system_prompt or "").strip()
+        self._system = resolve_system_prompt(system_prompt_preset, system_prompt_text)
         if clear and self._messages:
             n = len(self._messages) // 2
             self._messages = []
