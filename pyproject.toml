@@ -1,0 +1,12 @@
+[project]
+name = "comfyui-polystrata"
+description = "ComfyUI nodes for a self-hosted PolyStrata server: Schema-V3 chat (comfy_api.latest) with autogrow image pins (img_*) and separate video pins (vid_*, each pin = one video as sequential frames; video_fps adds llama.cpp-style '<X.X seconds>' time markers between frames - same markers the engine emits when Jan sends a whole video as input_video), per-pin frame limits with engine-context preflight, text+thoughts outputs, ComfyUI Cancel/interrupt support, no streaming; sampling subnode without duplicates (top_k/min_p/penalties/stop/seed/logit_bias/extra_sampling); Memory history; reserve VRAM writes the server's ACTUAL usage + extra into ComfyUI EXTRA_RESERVED_VRAM (llama.cpp-nodes method); pass-through full-unload restores it. Strata-poly 0.1.45-poly.6+, no config keys, model loads on demand."
+version = "0.7.1"
+license = { text = "MIT" }
+dependencies = ["requests"]
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "ComfyUI PolyStrata"
+Icon = ""
+Tags = ["llm", "polystrata", "chat", "vram", "video", "schema-v3", "interrupt", "timestamps"]
