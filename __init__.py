@@ -11,6 +11,14 @@
 ноде); reasoning/temperature/top_p/seed - в главной ноде, без дубликатов в
 Sampling. Выходы: text + thoughts. Лимиты max_images/max_video_frames - НА КАЖДЫЙ пин
 своего типа, кадры заранее подгоняются под контекст движка (двигок запросы не обрезает).
+Тоггл clear_comfy_vram: перед генерацией выгрузить модели САМОГО ComfyUI (как кнопка
+'Free model and node cache') - в одном запуске воркфлоу ОДИН РАЗ: лист картинок на входе,
+цикл list-паков, перебор сидов или несколько нод Chat исполняют ноду многократно, но
+после первой очистки выгружать нечего (результат тот же) - повторные пропускаются; флаг
+сбрасывает хук PromptExecutor.execute в начале каждого запуска. Листы на любых входах
+(list-паки) обрабатываются безопасно и без перечисления имён виджетов (универсальный
+нормализатор всего kwargs): скалярные виджеты берут первый элемент, списки
+картинок разворачиваются в пины.
 Interrupt (кнопка Cancel ComfyUI) прерывает генерацию: interruptible-запрос идёт через
 http.client, при срабатывании stop_check сокет закрывается ПО-НАСТОЯЩЕМУ (FIN) - watch-поток
 PolyStrata (_watch_client) видит EOF и отменяет генерацию движка
@@ -66,4 +74,4 @@ except ImportError:
     NODE_DISPLAY_NAME_MAPPINGS = _nodes.NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
-__version__ = "0.7.3"
+__version__ = "0.7.5"

@@ -13,6 +13,14 @@
                         Лимиты max_images/max_video_frames - НА КАЖДЫЙ пин своего типа;
                         перед отправкой кадры подгоняются под контекст движка (двигок сам
                         запросы НЕ обрезает - отклоняет 400 'exceeds the context window').
+                        Тоггл clear_comfy_vram: перед генерацией выгрузить модели САМОГО
+                        ComfyUI (unload_all_models + torch-кэш, как кнопка 'Free model and
+                        node cache'); в одном запуске воркфлоу - ОДИН РАЗ (листы/циклы/сиды
+                        не дёргают память повторно, флаг сбрасывает хук execute). Листы на
+                        любых входах (list-паки) обрабатываются безопасно и БЕЗ хардкода
+                        имён: _scalars прогоняет весь kwargs на входе ноды - скалярные
+                        виджеты берут первый элемент (новые виджеты защищены автоматически),
+                        списки картинок/видео разворачиваются в пины (_as_pins).
                         Interrupt (кнопка Cancel ComfyUI) прерывает генерацию: соединение
                         закрывается, сервер отменяет запрос при обрыве клиента.
   PolyStrata Sampling - тонкий сэмплинг БЕЗ дубликатов (temperature/top_p/reasoning/seed живут
@@ -248,6 +256,18 @@ EXTRA_TOOLTIP = (
     "prompt-path loan движка на время генерации, чтобы ComfyUI не ловил OOM."
 )
 
+CLEAR_VRAM_TOOLTIP = (
+    "Тоггл: ПЕРЕД генерацией выгрузить модели САМОГО ComfyUI (checkpoint/LoRA/ControlNet и "
+    "пр.) и почистить torch-кэш - то же, что кнопка 'Free model and node cache': VRAM "
+    "освобождается под запрос PolyStrata; при нужде ComfyUI загрузит модели обратно сам. "
+    "Модель PolyStrata это НЕ задевает.\n"
+    "В ОДНОМ запуске воркфлоу очистка делается ОДИН РАЗ: лист на входе (цикл по картинкам, "
+    "батчи), перебор сидов, несколько нод Chat - нода исполняется многократно, но после "
+    "первой очистки выгружать уже нечего (результат тот же), поэтому повторные пропускаются. "
+    "С началом следующего запуска (очередь) очистка снова доступна.\n"
+    "Выкл (по умолчанию) - нода не трогает память ComfyUI."
+)
+
 IMAGES_TOOLTIP = (
     "Картинки (IMAGE). Autogrow: подключите img_0 - появится img_1, и так до 50 пинов. "
     "Каждый пин - картинка ИЛИ батч [N,H,W,C]: кадры батча раскрываются по одному с метками "
@@ -404,13 +424,49 @@ def _sorted_autogrow(d) -> list:
     return [d[k] for k in sorted(d.keys(), key=_key)]
 
 
+def _scalar(value, name: str):
+    """Значение виджета пришло СПИСКОМ (list-паки циклов/переборов шлют листы в любые входы,
+    не только в картинки) -> берётся ПЕРВЫЙ элемент, чтобы нода не упала и отработала
+    предсказуемо: скалярные виджеты (prompt/seed/резервы/...) не умеют листы, а результат от
+    этого не меняется - очистка памяти и запрос делаются один раз (см. _maybe_clear_comfy_vram).
+    Пустой список -> None (виджет считается незаданным)."""
+    if isinstance(value, (list, tuple)):
+        v = value[0] if len(value) else None
+        print(f"[PolyStrata] {name}: пришёл список ({len(value)} знач.) - взят первый элемент",
+              flush=True)
+        return v
+    return value
+
+
+# Единственные входы, которым списки ЛЕГАЛЬНЫ: autogrow-пины/батчи картинок и видео -
+# их разворачивает в пины _as_pins (рекурсивно, списки списков включительно).
+_LIST_INPUTS = ("images", "videos")
+
+
+def _scalars(kwargs: dict) -> dict:
+    """Универсальная нормализация входов ноды БЕЗ хардкода имён виджетов: весь kwargs
+    прогоняется через _scalar - ЛЮБОЙ вход, пришедший списком (list-паки циклов/переборов,
+    батчи сидов, листы в саб-ноды), заменяется первым элементом. Имена не перечисляются,
+    поэтому новый виджет защищён автоматически - при добавлении поля не нужно помнить про
+    листы. Исключение только семантическое - _LIST_INPUTS (images/videos): там список и
+    есть значение, его разворачивает в пины _as_pins."""
+    return {k: v if k in _LIST_INPUTS else _scalar(v, k) for k, v in kwargs.items()}
+
+
 def _as_pins(v) -> list:
     """V3 autogrow dict {'img_0': ...} -> список значений по номерам пинов; одиночный вход
-    (тензор/массив IMAGE из V1-фолбэка или одиночного подключения) -> [значение]."""
+    (тензор/массив IMAGE из V1-фолбэка или одиночного подключения) -> [значение].
+    Список от list-паков (['батч', 'батч'] или список одиночных картинок) -> элементы
+    по порядку: каждый батч остаётся отдельным пином, кадры нумеруются сквозняком."""
     if v is None:
         return []
     if isinstance(v, dict):
         return _sorted_autogrow(v)
+    if isinstance(v, (list, tuple)):
+        out: list = []
+        for item in v:
+            out.extend(_as_pins(item))
+        return out
     return [v]
 
 
@@ -774,6 +830,7 @@ def install_auto_unload_hooks() -> bool:
 
         def _hooked_execute(self, prompt, prompt_id, *args, **kwargs):
             try:
+                note_workflow_start()   # новый запуск: тоггл clear_comfy_vram снова доступен
                 threading.Thread(target=_auto_unload_for_prompt, args=(prompt,),
                                  daemon=True).start()   # очередь не ждёт HTTP
             except Exception as e:
@@ -802,6 +859,82 @@ def install_auto_unload_hooks() -> bool:
     print("[PolyStrata] авто-выгрузка активна: главная нода забайпашена / открыт другой "
           "воркфлоу - модель выгружается сама (как в llama.cpp-нодах)", flush=True)
     return True
+
+
+# ================================================================ очистка памяти ComfyUI (тоггл)
+# Виджет clear_comfy_vram ноды Chat: перед генерацией выгрузить модели САМОГО ComfyUI
+# (checkpoint/LoRA/ControlNet - всё, что ComfyUI держит в VRAM) и почистить torch-кэш -
+# механика кнопки "Free model and node cache" (mm.unload_all_models) + soft_empty_cache + gc.
+# Модель PolyStrata это НЕ задевает: наш хук unload_all_models внутри выполнения нод
+# (execution.py в стеке) серверы PolyStrata не трогает.
+#
+# «НЕ ОЧИЩАТЬ МНОГО РАЗ»: листы на входах (циклы list-паков, батчи картинок, перебор сидов,
+# несколько нод Chat) исполняют ноду многократно в ОДНОМ запуске воркфлоу - очистка делается
+# только на ПЕРВОМ исполнении (_COMFY_CLEAR), флаг сбрасывается в начале КАЖДОГО запуска
+# воркфлоу (note_workflow_start из хука PromptExecutor.execute - того же, что у авто-выгрузки).
+_COMFY_CLEAR = {"done": False}     # очистка уже сделана в текущем запуске воркфлоу
+
+
+def note_workflow_start() -> None:
+    """Начался новый запуск воркфлоу: флаг «память ComfyUI уже очищена» сброшен.
+    Вызывается хуком PromptExecutor.execute (см. install_auto_unload_hooks); безопасно
+    звать и напрямую (повторные вызовы - no-op)."""
+    with _AUTO_LOCK:
+        _COMFY_CLEAR["done"] = False
+
+
+def free_comfy_model_memory() -> str:
+    """Выгрузить модели ComfyUI + почистить torch-кэш (как кнопка 'Free model and node cache').
+    Модели PolyStrata не задеваются (см. секцию авто-выгрузки). Возвращает человекочитаемую
+    строку для лога; исключений не бросает - очистка не должна ронять генерацию."""
+    try:
+        import comfy.model_management as mm
+    except Exception as e:
+        return f"не удалось: comfy.model_management недоступен ({e})"
+    notes = []
+    unload = getattr(mm, "unload_all_models", None)
+    if unload is not None:
+        try:
+            unload()
+            notes.append("модели ComfyUI выгружены (unload_all_models)")
+        except Exception as e:
+            notes.append(f"выгрузка моделей не удалась: {e}")
+    else:
+        notes.append("unload_all_models недоступен в этой версии ComfyUI")
+    try:
+        cache_fn = getattr(mm, "soft_empty_cache", None) or getattr(mm, "empty_cache", None)
+        if cache_fn is not None:
+            cache_fn()
+            notes.append("torch-кэш очищен")
+    except Exception as e:
+        notes.append(f"torch-кэш не очищен: {e}")
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    return "; ".join(notes)
+
+
+def _maybe_clear_comfy_vram(enabled) -> str:
+    """Тоггл clear_comfy_vram: очистить память моделей ComfyUI ОДИН РАЗ на запуск воркфлоу.
+    Лист на входе (цикл по картинкам/сидам, несколько нод Chat) исполняет ноду многократно -
+    повторные очистки бессмысленны: после первой выгружать нечего, результат тот же. Флаг
+    сбрасывается в начале каждого запуска воркфлоу (note_workflow_start). Если хуки не
+    установились (comfy недоступен - тесты), сбрасывать флаг некому - тогда очистка делается
+    на каждом вызове (безопасный запасной путь, никогда не 'залипает')."""
+    if not enabled:
+        return ""
+    with _AUTO_LOCK:
+        done = _COMFY_CLEAR["done"]
+        _COMFY_CLEAR["done"] = True
+    if done and _AUTO_HOOKS["installed"]:
+        print("[PolyStrata] очистка памяти ComfyUI: уже сделана в этом запуске воркфлоу "
+              "(лист/цикл/повторное исполнение) - пропуск", flush=True)
+        return "уже очищено в этом запуске"
+    note = free_comfy_model_memory()
+    print(f"[PolyStrata] очистка памяти ComfyUI перед генерацией: {note}", flush=True)
+    return note
 
 
 # ================================================================ общее ядро Chat
@@ -873,17 +1006,26 @@ def _server_ctx(client: PolyStrataClient) -> int:
         return 0
 
 
-def _chat_generate(server: str, api_key: str, prompt: str, system_prompt: str, model: str,
-                   reasoning: str, max_tokens: int, temperature: float, top_p: float, seed: int,
-                   reserve_mib: int, extra_mib: int, images, videos, max_images: int,
-                   max_video_frames: int, max_frame_side: int, memory, sampling,
-                   video_fps: int = 0) -> tuple:
+def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: str = "",
+                   system_prompt: str = "", model: str = "", reasoning: str = "default",
+                   max_tokens: int = 1024, temperature: float = 0.8, top_p: float = 0.95,
+                   seed: int = 0, reserve_mib: int = 0, extra_mib: int = 0, images=None,
+                   videos=None, max_images: int = 16, max_video_frames: int = 8,
+                   max_frame_side: int = DEFAULT_FRAME_SIDE, memory=None, sampling=None,
+                   video_fps: int = 0, clear_comfy_vram: bool = False) -> tuple:
     """Единое ядро генерации для V3-нода (execute) и V1-фолбэка (generate).
     Возвращает (text, thoughts). Кнопка Cancel (interrupt) ComfyUI прерывает на любом шаге:
     во время запроса сокет закрывается ПО-НАСТОЯЩЕМУ (FIN), и watch-поток PolyStrata
-    (_watch_client: select + MSG_PEEK каждые 0.5 c) отменяет генерацию движка."""
+    (_watch_client: select + MSG_PEEK каждые 0.5 c) отменяет генерацию движка.
+    Входы приходят УЖЕ нормализованными: на входе ноды _scalars прогоняет весь kwargs
+    (имена виджетов нигде не хардкодятся - любые списки от list-паков заменены первыми
+    элементами, медиа-списки разворачивает в пины _as_pins); тоггл clear_comfy_vram
+    выгружает модели ComfyUI ОДИН РАЗ на запуск воркфлоу."""
     _throw_if_interrupted()                      # прервано ДО старта - сервер не дёргаем
     mark_server_active(server)                   # авто-выгрузка: сервер под наблюдением
+    # --- тоггл: очистить память моделей ComfyUI перед генерацией (один раз на запуск воркфлоу)
+    _maybe_clear_comfy_vram(clear_comfy_vram)
+    _throw_if_interrupted()
     store = memory if hasattr(memory, "remember") else None
     sd = dict(sampling) if isinstance(sampling, dict) else {}
 
@@ -1047,6 +1189,9 @@ if _HAS_V3:
         Спящая модель (после Unload) просыпается сама: сервер грузит движок по требованию.
         reserve_mib > 0 - перед генерацией отдать VRAM ComfyUI (пониженное потребление)
         и выставить бронь EXTRA_RESERVED_VRAM по факту; 0 - не влиять.
+        clear_comfy_vram - тоггл: перед генерацией выгрузить модели САМОГО ComfyUI
+        (checkpoint/LoRA и пр.) и почистить torch-кэш; в одном запуске воркфлоу - ОДИН РАЗ
+        (лист на входе / цикл / несколько нод Chat повторно память не дёргают).
         max_images/max_video_frames - лимиты НА КАЖДЫЙ пин своего типа; кадры заранее
         подгоняются под контекст движка (узнаётся из /v1/status), потому что двигок запросы
         не обрезает. Кнопка Cancel (interrupt) ComfyUI прерывает генерацию: соединение
@@ -1115,6 +1260,8 @@ if _HAS_V3:
                                        tooltip=RESERVE_TOOLTIP),
                     comfy_io.Int.Input("extra_mib", default=0, min=0, max=262144, step=64,
                                        tooltip=EXTRA_TOOLTIP),
+                    comfy_io.Boolean.Input("clear_comfy_vram", default=False,
+                                           tooltip=CLEAR_VRAM_TOOLTIP),
                     comfy_io.String.Input("api_key", default="", tooltip=API_KEY_TOOLTIP),
                     comfy_io.Int.Input("max_images", default=16, min=0, max=MAX_IMAGES_PER_PIN,
                                        step=1, tooltip=MAX_IMAGES_TOOLTIP),
@@ -1142,19 +1289,15 @@ if _HAS_V3:
             )
 
         @classmethod
-        def execute(cls, server="127.0.0.1:8080", prompt="Опиши это видео или изображения подробно.",
-                    system_prompt_preset=NO_SYSTEM_PROMPT, system_prompt_text="", model="",
-                    reasoning="default", max_tokens=1024,
-                    temperature=0.8, top_p=0.95, seed=0, max_frame_side=DEFAULT_FRAME_SIDE,
-                    reserve_mib=0, extra_mib=0, api_key="", max_images=16, max_video_frames=8,
-                    video_fps=0, images=None, videos=None, memory=None,
-                    sampling=None) -> comfy_io.NodeOutput:
-            system_prompt = resolve_system_prompt(system_prompt_preset, system_prompt_text)
-            text, thoughts = _chat_generate(
-                server, api_key, prompt, system_prompt, model, reasoning, max_tokens,
-                temperature, top_p, seed, reserve_mib, extra_mib, images, videos,
-                max_images, max_video_frames, max_frame_side, memory, sampling,
-                video_fps=video_fps)
+        def execute(cls, **kw) -> comfy_io.NodeOutput:
+            """Входы приходят с именами виджетов из схемы (в т.ч. списками от list-паков).
+            Имена НЕ перечисляются: _scalars нормализует весь kwargs разом, дальше ядро
+            получает готовые скаляры. Новый виджет в схеме защищён от листов автоматически."""
+            kw = _scalars(kw)
+            kw["system_prompt"] = resolve_system_prompt(
+                kw.pop("system_prompt_preset", NO_SYSTEM_PROMPT),
+                kw.pop("system_prompt_text", ""))
+            text, thoughts = _chat_generate(**kw)
             return comfy_io.NodeOutput(text, thoughts)
 
 else:
@@ -1202,6 +1345,7 @@ else:
                                             "tooltip": RESERVE_TOOLTIP}),
                     "extra_mib": ("INT", {"default": 0, "min": 0, "max": 262144, "step": 64,
                                           "tooltip": EXTRA_TOOLTIP}),
+                    "clear_comfy_vram": ("BOOLEAN", {"default": False, "tooltip": CLEAR_VRAM_TOOLTIP}),
                     "api_key": ("STRING", {"default": "", "tooltip": API_KEY_TOOLTIP}),
                     "max_images": ("INT", {"default": 16, "min": 0, "max": MAX_IMAGES_PER_PIN,
                                            "step": 1, "tooltip": MAX_IMAGES_TOOLTIP}),
@@ -1227,18 +1371,15 @@ else:
         FUNCTION = "generate"
         CATEGORY = "PolyStrata"
 
-        def generate(self, server, prompt, system_prompt_preset=NO_SYSTEM_PROMPT,
-                     system_prompt_text="", model="", reasoning="default",
-                     max_tokens=1024, temperature=0.8, top_p=0.95, seed=0,
-                     max_frame_side=DEFAULT_FRAME_SIDE, reserve_mib=0, extra_mib=0,
-                     api_key="", max_images=16, max_video_frames=8, video_fps=0,
-                     images=None, videos=None, memory=None, sampling=None):
-            system_prompt = resolve_system_prompt(system_prompt_preset, system_prompt_text)
-            text, thoughts = _chat_generate(
-                server, api_key, prompt, system_prompt, model, reasoning, max_tokens,
-                temperature, top_p, seed, reserve_mib, extra_mib, images, videos,
-                max_images, max_video_frames, max_frame_side, memory, sampling,
-                video_fps=video_fps)
+        def generate(self, **kw):
+            """Входы приходят с именами виджетов из INPUT_TYPES (в т.ч. списками от list-паков).
+            Имена НЕ перечисляются: _scalars нормализует весь kwargs разом, дальше ядро
+            получает готовые скаляры. Новый виджет в INPUT_TYPES защищён от листов автоматически."""
+            kw = _scalars(kw)
+            kw["system_prompt"] = resolve_system_prompt(
+                kw.pop("system_prompt_preset", NO_SYSTEM_PROMPT),
+                kw.pop("system_prompt_text", ""))
+            text, thoughts = _chat_generate(**kw)
             return (text, thoughts)
 
 

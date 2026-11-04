@@ -14,7 +14,7 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 
 | Файл | Роль |
 | --- | --- |
-| `nodes.py` | Все ноды: `PolyStrataChat`, `PolyStrataSampling`, `PolyStrataMemory`, `PolyStrataUnload` + `NODE_CLASS_MAPPINGS`. Тултипы на русском, там же - основная документация виджетов. |
+| `nodes.py` | Все ноды: `PolyStrataChat`, `PolyStrataSampling`, `PolyStrataMemory`, `PolyStrataUnload` + `NODE_CLASS_MAPPINGS`. Тултипы на русском, там же - основная документация виджетов. В Chat - тоггл `clear_comfy_vram` (очистка памяти моделей ComfyUI перед генерацией, один раз на запуск воркфлоу) и обработка листов на входах: универсальный `_scalars` по всему kwargs (без перечисления имён) + `_as_pins`. |
 | `ps_client.py` | Тонкий HTTP-клиент (`PolyStrataClient`): chat/vram/unload/status, разбор ошибок (409 model_busy, 503+Retry-After, 400 --vram-elastic, 404 model); interruptible-запросы (`stop_check` - колбэк Cancel ComfyUI, при срабатывании соединение закрывается). |
 | `__init__.py` | Загрузка двумя способами (package-спека и старый загрузчик ComfyUI без package-контекста). Версия пакета - здесь (`__version__`). |
 | `tests/test_nodepack.py` | Портативный тест-харнесс: поднимает mock-сервер PolyStrata (форматы из `serve/server.py` и `docs/VRAM_ELASTIC.md`) и прогоняет все ноды. Запуск: `python tests/test_nodepack.py` (или `python3 scripts/test_nodepack.py` из workspace). |
@@ -80,6 +80,24 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 13. Ключ `"vram_elastic": true` в конфиге strata-poly-модели **вреден** (движок падает на
     неизвестном флаге `--vram-elastic`): тултипы и ошибки должны говорить «удалите ключ»,
     никогда - «добавьте».
+14. **Очистка памяти ComfyUI - ОДИН РАЗ на запуск воркфлоу** (тоггл `clear_comfy_vram` в
+    Chat): `free_comfy_model_memory` = `mm.unload_all_models()` + `soft_empty_cache` + gc
+    (механика кнопки 'Free model and node cache'); модели PolyStrata не задеваются (хук
+    авто-выгрузки внутри выполнения нод серверы не трогает). Флаг `_COMFY_CLEAR` ставится на
+    первом исполнении ноды и сбрасывается `note_workflow_start()` из хука
+    `PromptExecutor.execute` (тот же хук, что у авто-выгрузки): лист картинок, цикл
+    list-пака, перебор сидов, несколько нод Chat исполняют ноду многократно - очистка одна
+    (после первой выгружать нечего, результат тот же). Хуки не установились (comfy
+    недоступен) - очистка на КАЖДОМ вызове (никогда не «залипает»).
+15. **Листы на входах обрабатываются безопасно и БЕЗ хардкода имён виджетов**: list-паки
+    циклов/переборов могут прислать список в ЛЮБОЙ вход. Нормализация универсальна:
+    execute/generate принимают **kw и прогоняют ВЕСЬ kwargs через `_scalars` (каждый
+    список -> первый элемент, None для пустого; имена не перечисляются - новый виджет
+    защищён автоматически). Единственное исключение - `_LIST_INPUTS` (images/videos):
+    там список и есть значение, его разворачивает в пины `_as_pins` (батч остаётся
+    пином, нумерация кадров сквозная); memory/sampling-списки берут первый элемент -
+    история не теряется молча. Ядро `_chat_generate` получает уже нормализованные
+    скаляры - НЕ возвращать per-name `_scalar` в ядро при добавлении виджетов.
 
 ## Проверенные факты об API PolyStrata (обновляй по репозиторию сервера)
 
@@ -154,7 +172,7 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 ## Запуск тестов
 
 ```bash
-python tests/test_nodepack.py      # 122 проверки против mock-сервера
+python tests/test_nodepack.py      # 170 проверок против mock-сервера
 ```
 
 Все проверки должны быть зелёными перед коммитом. Mock-сервер в тесте - образец форматов
