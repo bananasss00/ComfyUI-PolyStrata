@@ -14,7 +14,7 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 
 | Файл | Роль |
 | --- | --- |
-| `nodes.py` | Все ноды: `PolyStrataChat`, `PolyStrataSampling`, `PolyStrataMemory`, `PolyStrataUnload` + `NODE_CLASS_MAPPINGS`. Тултипы на русском, там же - основная документация виджетов. В Chat - тоггл `clear_comfy_vram` (очистка памяти моделей ComfyUI перед генерацией, один раз на запуск воркфлоу) и обработка листов на входах: универсальный `_scalars` по всему kwargs (без перечисления имён) + `_as_pins`. |
+| `nodes.py` | Все ноды: `PolyStrataChat`, `PolyStrataSampling`, `PolyStrataMedia`, `PolyStrataMemory`, `PolyStrataUnload` + `NODE_CLASS_MAPPINGS`. Тултипы на русском, там же - основная документация виджетов. В Chat - тоггл `clear_comfy_vram` (очистка памяти моделей ComfyUI перед генерацией, один раз на запуск воркфлоу) и обработка листов на входах: универсальный `_scalars` по всему kwargs (без перечисления имён) + `_as_pins`. Виджетов model/api_key/extra_mib и медиа-лимитов в Chat НЕТ (v0.8.0): лимиты кадров - в субноде `PolyStrataMedia`, `top_k` - в чате после `top_p`. |
 | `ps_client.py` | Тонкий HTTP-клиент (`PolyStrataClient`): chat/vram/unload/status, разбор ошибок (409 model_busy, 503+Retry-After, 400 --vram-elastic, 404 model); interruptible-запросы (`stop_check` - колбэк Cancel ComfyUI, при срабатывании соединение закрывается). |
 | `__init__.py` | Загрузка двумя способами (package-спека и старый загрузчик ComfyUI без package-контекста). Версия пакета - здесь (`__version__`). |
 | `tests/test_nodepack.py` | Портативный тест-харнесс: поднимает mock-сервер PolyStrata (форматы из `serve/server.py` и `docs/VRAM_ELASTIC.md`) и прогоняет все ноды. Запуск: `python tests/test_nodepack.py` (или `python3 scripts/test_nodepack.py` из workspace). |
@@ -24,7 +24,8 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 ## Инварианты (не ломать)
 
 1. **Сервер запускает пользователь.** В нодах нет путей к GGUF, ngl, ctx_size и прочих
-   llama.cpp-параметров загрузки - только адрес сервера + api_key.
+   llama.cpp-параметров загрузки - только адрес сервера (api_key-виджетов нет: доступ
+   localhost; клиент умеет ключ, но ноды его не передают).
 2. **Без стриминга.** `/v1/chat/completions` всегда `stream:false`, ответ целиком.
 3. **Медиа - autogrow-пины schema V3.** Нода Chat - `comfy_io.ComfyNode` (comfy_api.latest):
    autogrow `img_0..img_49` (картинки, IMAGE) и ОТДЕЛЬНО `vid_0..vid_49` (видео = IMAGE-батч
@@ -35,7 +36,9 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
    типа VIDEO и аудио. На ComfyUI без comfy_api Chat собирается в V1 (фиксированные
    `images`/`videos`) - тот же формат через `_as_pins`. Выборка кадров - np.linspace (исходные
    индексы СОХРАНЯЮТСЯ - метки времени считаются от них);
-   `max_images` / `max_video_frames` - **НА КАЖДЫЙ пин** своего типа (0 = все кадры пина, потолки 64/128 на пин), и кадры
+   `max_images` / `max_video_frames` - **НА КАЖДЫЙ пин** своего типа (0 = все кадры пина,
+   потолки 64/128 на пин; виджеты - в субноде `PolyStrataMedia`, вход 'media' чата; без неё
+   - дефолты 1024/16/8/0, сентинелов в Media НЕТ - реальные значения), и кадры
    заранее подгоняются под контекст движка (`_fit_media_to_context`, окно из
    `context.native` /v1/status, запасной путь /props): двигок запросы НЕ обрезает -
    отклоняет 400 'exceeds the context window'. **Interrupt (Cancel ComfyUI)**:
@@ -53,13 +56,14 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 5. **Частичный успех `/v1/vram` - это HTTP 200**: сверять `vram_free_mib >= reserve_mib`
    и помечать «ЧАСТИЧНОЕ ОСВОБОЖДЕНИЕ» в логе.
 6. **Нод Load/VRAM в паке нет** (v3): модель грузится сервером по требованию; резерв -
-   виджеты `reserve_mib`/`extra_mib` в Chat; полная выгрузка - Unload (она же сбрасывает
+   виджет `reserve_mib` в Chat; полная выгрузка - Unload (она же сбрасывает
    запомненный сервером резерв через `{"reserve_mib": null}`).
 7. **Сквозная Unload**: `any_input` (тип `*`, `AnyType.__ne__ -> False`) → `any_output`,
    `OUTPUT_NODE = True`.
-8. **Дубликатов сэмплинга нет**: `temperature`, `top_p`, `reasoning`, `seed` - ТОЛЬКО в ноде
-   Chat (в Sampling их нет; seed с control_after_generate, 0 = случайный - не отправляется).
-   Sampling - остальное: top_k, min_p, repeat_penalty, repeat_last_n,
+8. **Дубликатов сэмплинга нет**: `temperature`, `top_p`, `top_k` (после `top_p`), `reasoning`,
+   `seed` - ТОЛЬКО в ноде Chat (в Sampling их нет; seed с control_after_generate, 0 = случайный -
+   не отправляется; top_k -1/0 = умолчание сервера - не отправляется).
+   Sampling - остальное: min_p, repeat_penalty, repeat_last_n,
    presence/frequency_penalty, stop + logit_bias + extra_sampling.
 9. **Семплеры - только те, что реально принимает сервер.** Белый список (см. ниже) + `stop`
    (до 4 строк) + reasoning. НИКАКИХ виджетов typical_p/tfs/xtc/dry/dynatemp/mirostat/
@@ -71,7 +75,7 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 11. **Бронь VRAM для ComfyUI - метод llama.cpp-нод** (update_global_vram_reservation из
     LlamaCPP-Subprocess): reserve > 0 → в `comfy.model_management.EXTRA_RESERVED_VRAM`
     пишется ФАКТИЧЕСКОЕ потребление PolyStrata (`/v1/status machine.gpu.total_mib -
-    vram_free_mib` из ответа /v1/vram) + extra_mib (НЕ запрошенная цель!), + headroom в
+    vram_free_mib` из ответа /v1/vram) (НЕ запрошенная цель!), + headroom в
     comfy-aimdo (`comfy_aimdo.control.set_simple_vram_headroom`), если aimdo активен;
     исходное значение кэшируется один раз. У ноды Unload / на спящей модели - исходное
     значение ВОЗВРАЩАЕТСЯ. Ошибки брони - best-effort, генерацию не роняют.
@@ -95,9 +99,17 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
     список -> первый элемент, None для пустого; имена не перечисляются - новый виджет
     защищён автоматически). Единственное исключение - `_LIST_INPUTS` (images/videos):
     там список и есть значение, его разворачивает в пины `_as_pins` (батч остаётся
-    пином, нумерация кадров сквозная); memory/sampling-списки берут первый элемент -
-    история не теряется молча. Ядро `_chat_generate` получает уже нормализованные
-    скаляры - НЕ возвращать per-name `_scalar` в ядро при добавлении виджетов.
+    пином, нумерация кадров сквозная); memory/sampling/media-объекты, обёрнутые листом,
+    берут первый элемент - история/настройки не теряются молча. Ядро `_chat_generate`
+    получает уже нормализованные скаляры - НЕ возвращать per-name `_scalar` в ядро при
+    добавлении виджетов.
+16. **Компактный интерфейс (v0.8.0)**: виджетов `model`/`api_key`/`extra_mib` в нодах НЕТ.
+    Поле 'model' в запрос не отправляется вовсе (сервер берёт запущенную модель;
+    ps_client.chat(model="") оставлен внутренним). Клиент умеет api_key, но ноды его
+    не передают. Резерв - один `reserve_mib` (`_apply_reserve` зовётся с extra_mib=0,
+    параметр оставлен внутренним). Лимиты кадров - субнода `PolyStrataMedia` (тип
+    PS_MEDIA, без сентинелов), `top_k` - виджет чата после `top_p` (-1 = умолчание
+    сервера, клиент не шлёт <=0).
 
 ## Проверенные факты об API PolyStrata (обновляй по репозиторию сервера)
 

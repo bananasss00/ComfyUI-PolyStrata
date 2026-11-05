@@ -23,18 +23,24 @@
                         списки картинок/видео разворачиваются в пины (_as_pins).
                         Interrupt (кнопка Cancel ComfyUI) прерывает генерацию: соединение
                         закрывается, сервер отменяет запрос при обрыве клиента.
-  PolyStrata Sampling - тонкий сэмплинг БЕЗ дубликатов (temperature/top_p/reasoning/seed живут
-                        в ноде Chat): top_k, min_p, штрафы, stop + logit_bias
+  PolyStrata Sampling - тонкий сэмплинг БЕЗ дубликатов (temperature/top_p/top_k/reasoning/seed
+                        живут в ноде Chat): min_p, штрафы, stop + logit_bias
                         (запрет токенов, как banned_tokens в llama-нодах) + extra_sampling
                         (JSON-сквозняк: любые поля запроса - задел на будущие семплеры).
+  PolyStrata Media     - опциональная субнода-оверрайд медиа-лимитов для Chat: max_frame_side,
+                        max_images, max_video_frames, video_fps. Без неё у Chat - дефолты.
   PolyStrata Memory   - обработчик истории (хендлер): копит пары вопрос-ответ между
                         запусками. Без него Chat работает одиночным запросом.
   PolyStrata Unload   - полная выгрузка модели (POST /v1/unload). Сквозная. Возвращает
                         ComfyUI исходное EXTRA_RESERVED_VRAM (бронь снимается).
 
-Резерв VRAM для ComfyUI (reserve_mib/extra_mib в Chat) - логика update_global_vram_reservation
+Компактность (v0.8.0): у нод НЕТ виджетов model/api_key/extra_mib и медиа-лимитов - модель
+та, что запущена на сервере (поле 'model' не отправляется), доступ localhost, резерв - один
+reserve_mib, лимиты кадров - в опциональной субноде Media (top_k переехал в Chat после top_p).
+
+Резерв VRAM для ComfyUI (reserve_mib в Chat) - логика update_global_vram_reservation
 из llama.cpp-нод (LlamaCPP-Subprocess): фактическое потребление PolyStrata (total GPU -
-фактически свободно) + extra_mib записывается в comfy.model_management.EXTRA_RESERVED_VRAM
+фактически свободно) записывается в comfy.model_management.EXTRA_RESERVED_VRAM
 и в headroom DynamicVRAM (comfy-aimdo), поэтому ComfyUI грузит свои модели, не выходя за
 пределы реального окна, и не ловит OOM. Unload возвращает исходные значения.
 
@@ -90,6 +96,7 @@ class AnyType(str):
 ANY = AnyType("*")
 PS_MEMORY = "PS_MEMORY"        # выход ноды Memory -> вход 'memory' ноды Chat
 PS_SAMPLING = "PS_SAMPLING"    # выход ноды Sampling -> вход 'sampling' ноды Chat
+PS_MEDIA = "PS_MEDIA"          # выход ноды Media -> вход 'media' ноды Chat
 
 # ---------------------------------------------------------------- interrupt (Cancel ComfyUI)
 try:
@@ -228,11 +235,6 @@ SERVER_TOOLTIP = (
     "Сервер вы запускаете САМИ (run-<модель>.bat / START-HERE.bat); ноды только шлют запросы."
 )
 
-API_KEY_TOOLTIP = (
-    "API-ключ, если на сервере PolyStrata задан 'api_key' (нужен при доступе не с localhost). "
-    "Пусто - не отправлять."
-)
-
 ELASTIC_NOTE = (
     "Elastic VRAM у strata-poly встроен (движок 0.1.45-poly.6 и новее, обновление - UPDATE.bat): "
     "ключи в конфиг модели не нужны, и ключ \"vram_elastic\": true там ВРЕДЕН (движок падает на "
@@ -246,14 +248,6 @@ RESERVE_TOOLTIP = (
     "0 = НЕ ВЛИЯЕТ ни на PolyStrata, ни на бронь ComfyUI (никаких запросов).\n"
     "Значение сервер запоминает до сброса (Unload) или перезапуска сервера. Если экспертов не "
     "хватило, будет частичное освобождение (см. лог). " + ELASTIC_NOTE
-)
-
-EXTRA_TOOLTIP = (
-    "Дополнительный запас MiB. Два применения:\n"
-    "1) цель свободной VRAM на сервере = reserve_mib + extra_mib;\n"
-    "2) в бронь ComfyUI (EXTRA_RESERVED_VRAM, как в llama.cpp-нодах) пишется ФАКТИЧЕСКОЕ "
-    "потребление PolyStrata (сколько не удалось освободить) + extra_mib - запас под "
-    "prompt-path loan движка на время генерации, чтобы ComfyUI не ловил OOM."
 )
 
 CLEAR_VRAM_TOOLTIP = (
@@ -316,6 +310,17 @@ SEED_TOOLTIP = (
     "Seed сэмплинга. 0 = случайный (поле не отправляется); >0 - фиксированный. "
     "control_after_generate работает (fix/increment/decrement/randomize).\nВнимание (PolyStrata): "
     "с адаптивным resident-уровнем экспертов повтор с тем же seed не обязан давать тот же текст."
+)
+
+TOP_K_TOOLTIP = (
+    "Top-K сэмплинга: остаются только K самых вероятных токенов. -1 = не задано (умолчание "
+    "сервера, поле не отправляется); 1..64 (движок ограничивает сверху 64)."
+)
+
+MEDIA_INPUT_TOOLTIP = (
+    "Опционально: нода 'PolyStrata Media' - лимиты кадров (max_images/max_video_frames), "
+    "ужатие max_frame_side и метки времени video_fps. Без неё - значения по умолчанию "
+    "(16 картинок/пин, 8 кадров/пин, сторона 1024, без меток)."
 )
 
 SAMPLERS_NOTE = (
@@ -1006,13 +1011,13 @@ def _server_ctx(client: PolyStrataClient) -> int:
         return 0
 
 
-def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: str = "",
-                   system_prompt: str = "", model: str = "", reasoning: str = "default",
+def _chat_generate(server: str = "127.0.0.1:8080", prompt: str = "",
+                   system_prompt: str = "", reasoning: str = "default",
                    max_tokens: int = 1024, temperature: float = 0.8, top_p: float = 0.95,
-                   seed: int = 0, reserve_mib: int = 0, extra_mib: int = 0, images=None,
+                   top_k: int = -1, seed: int = 0, reserve_mib: int = 0, images=None,
                    videos=None, max_images: int = 16, max_video_frames: int = 8,
                    max_frame_side: int = DEFAULT_FRAME_SIDE, memory=None, sampling=None,
-                   video_fps: int = 0, clear_comfy_vram: bool = False) -> tuple:
+                   media=None, video_fps: int = 0, clear_comfy_vram: bool = False) -> tuple:
     """Единое ядро генерации для V3-нода (execute) и V1-фолбэка (generate).
     Возвращает (text, thoughts). Кнопка Cancel (interrupt) ComfyUI прерывает на любом шаге:
     во время запроса сокет закрывается ПО-НАСТОЯЩЕМУ (FIN), и watch-поток PolyStrata
@@ -1020,8 +1025,19 @@ def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: st
     Входы приходят УЖЕ нормализованными: на входе ноды _scalars прогоняет весь kwargs
     (имена виджетов нигде не хардкодятся - любые списки от list-паков заменены первыми
     элементами, медиа-списки разворачивает в пины _as_pins); тоггл clear_comfy_vram
-    выгружает модели ComfyUI ОДИН РАЗ на запуск воркфлоу."""
+    выгружает модели ComfyUI ОДИН РАЗ на запуск воркфлоу.
+    Имени модели и api_key у нод нет: модель - запущенная на сервере (поле 'model' не
+    отправляется), доступ - localhost. Субнода Media (опционально) переопределяет лимиты
+    кадров max_images/max_video_frames, ужатие max_frame_side и метки video_fps целиком:
+    не подключена - дефолты из сигнатуры. top_k - виджет чата; <=0 поле не отправляется
+    (умолчание сервера)."""
     _throw_if_interrupted()                      # прервано ДО старта - сервер не дёргаем
+    # --- субнода Media (опционально): переопределяет ВСЕ медиа-лимиты разом
+    if media is not None:
+        max_frame_side = int(media.max_frame_side)
+        max_images = int(media.max_images)
+        max_video_frames = int(media.max_video_frames)
+        video_fps = int(media.video_fps)
     mark_server_active(server)                   # авто-выгрузка: сервер под наблюдением
     # --- тоггл: очистить память моделей ComfyUI перед генерацией (один раз на запуск воркфлоу)
     _maybe_clear_comfy_vram(clear_comfy_vram)
@@ -1032,8 +1048,8 @@ def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: st
     # --- reserve VRAM для ComfyUI (ДО генерации; 0 = не трогаем сервер вовсе)
     reserve_note = ""
     if reserve_mib and int(reserve_mib) > 0:
-        client0 = PolyStrataClient(server, api_key)
-        reserve_note = _apply_reserve(client0, int(reserve_mib), int(extra_mib or 0),
+        client0 = PolyStrataClient(server)
+        reserve_note = _apply_reserve(client0, int(reserve_mib), 0,
                                       stop_check=_throw_if_interrupted)
         _throw_if_interrupted()                  # выгрузка сегментов кэша может быть долгой
 
@@ -1044,7 +1060,7 @@ def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: st
     hist = store.history() if store is not None else []
 
     # --- контекст движка (best-effort) -> префлайт: кадры подгоняются под окно заранее
-    client = PolyStrataClient(server, api_key)
+    client = PolyStrataClient(server)
     n_ctx = _server_ctx(client)
     text_chars = len(sys_line) + len(prompt or "") + \
         sum(len(str(m.get("content") or "")) for m in hist)
@@ -1066,7 +1082,9 @@ def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: st
     messages.append({"role": "user", "content": parts if has_media else prompt})
 
     # сэмплинг: виджеты этой ноды - база; подключённая нода Sampling перекрывает
-    kw = {"temperature": temperature, "top_p": top_p, "reasoning": reasoning, "seed": seed}
+    # (top_k <=0 клиент не отправляет - действует умолчание сервера)
+    kw = {"temperature": temperature, "top_p": top_p, "top_k": top_k,
+          "reasoning": reasoning, "seed": seed}
     kw.update({k: v for k, v in sd.items() if v is not None})
 
     notes = []
@@ -1088,7 +1106,7 @@ def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: st
         print("[PolyStrata] контекст движка неизвестен (сервер не ответил?) - префлайт окна "
               "пропущен, работают только лимиты кадров на пин", flush=True)
     try:
-        resp = client.chat(messages, model=model, max_tokens=max_tokens, stop_check=_throw_if_interrupted, **kw)
+        resp = client.chat(messages, max_tokens=max_tokens, stop_check=_throw_if_interrupted, **kw)
     except _Interrupted:
         print("[PolyStrata] ПРЕРВАНО (Cancel ComfyUI): соединение закрыто - сервер отменяет "
               "генерацию; ход в память не записан", flush=True)
@@ -1114,13 +1132,15 @@ def _chat_generate(server: str = "127.0.0.1:8080", api_key: str = "", prompt: st
     return text, thoughts
 
 
-def _apply_reserve(client: PolyStrataClient, reserve_mib: int, extra_mib: int,
+def _apply_reserve(client: PolyStrataClient, reserve_mib: int, extra_mib: int = 0,
                    stop_check=None) -> str:
     """POST /v1/vram: держать reserve+extra MiB VRAM свободными для ComfyUI, затем -
     бронь ComfyUI по методу llama.cpp-нод: ФАКТИЧЕСКОЕ потребление PolyStrata
     (total GPU - фактически свободно) + extra_mib -> EXTRA_RESERVED_VRAM (+ aimdo).
-    Ошибки НЕ роняют генерацию (резерв - пожелание к скорости, а не условие);
-    stop_check позволяет прервать долгую выгрузку сегментов кэша кнопкой Cancel."""
+    extra_mib - внутренний параметр (виджета больше нет, ноды зовут с 0), оставлен,
+    чтобы не менять сигнатуру. Ошибки НЕ роняют генерацию (резерв - пожелание к скорости,
+    а не условие); stop_check позволяет прервать долгую выгрузку сегментов кэша кнопкой
+    Cancel."""
     target = reserve_mib + max(0, extra_mib)
     lines = []
     total_mib = None
@@ -1185,17 +1205,18 @@ if _HAS_V3:
         llama.cpp-нодах. Без стриминга: ответ целиком. Одиночный запрос сам по себе;
         история - опциональная нода Memory, тонкий сэмплинг - нода Sampling.
 
-        reasoning/temperature/top_p/seed живут ТОЛЬКО здесь (в Sampling их нет).
+        reasoning/temperature/top_p/top_k/seed живут ТОЛЬКО здесь (в Sampling их нет).
         Спящая модель (после Unload) просыпается сама: сервер грузит движок по требованию.
         reserve_mib > 0 - перед генерацией отдать VRAM ComfyUI (пониженное потребление)
         и выставить бронь EXTRA_RESERVED_VRAM по факту; 0 - не влиять.
         clear_comfy_vram - тоггл: перед генерацией выгрузить модели САМОГО ComfyUI
         (checkpoint/LoRA и пр.) и почистить torch-кэш; в одном запуске воркфлоу - ОДИН РАЗ
         (лист на входе / цикл / несколько нод Chat повторно память не дёргают).
-        max_images/max_video_frames - лимиты НА КАЖДЫЙ пин своего типа; кадры заранее
-        подгоняются под контекст движка (узнаётся из /v1/status), потому что двигок запросы
-        не обрезает. Кнопка Cancel (interrupt) ComfyUI прерывает генерацию: соединение
-        закрывается, сервер отменяет запрос.
+        Лимиты кадров - в опциональной субноде Media (вход 'media'): max_images/
+        max_video_frames - НА КАЖДЫЙ пин своего типа; кадры заранее подгоняются под
+        контекст движка (узнаётся из /v1/status), потому что двигок запросы не обрезает.
+        Кнопка Cancel (interrupt) ComfyUI прерывает генерацию: соединение закрывается,
+        сервер отменяет запрос.
         """
 
         @classmethod
@@ -1230,10 +1251,6 @@ if _HAS_V3:
                                           tooltip="Ручной системный промпт (роль system). Используется, если "
                                                   "пресет = none. Пусто - не отправляется. Перекрывается "
                                                   "системным промптом ноды Memory, если тот задан."),
-                    comfy_io.String.Input("model", default="",
-                                          tooltip="Имя модели для поля 'model'. Пусто - не отправляется "
-                                                  "(сервер использует запущенную). Имя должно совпадать с "
-                                                  "запущенной, иначе сервер вернёт 404."),
                     comfy_io.Combo.Input("reasoning",
                                          options=["default", "none", "low", "medium", "high"],
                                          default="default",
@@ -1253,23 +1270,13 @@ if _HAS_V3:
                     comfy_io.Float.Input("top_p", default=0.95, min=0.0, max=1.0, step=0.01,
                                          tooltip="Top-P (nucleus). Игнорируется, если подключён Sampling "
                                                  "и там задан свой."),
+                    comfy_io.Int.Input("top_k", default=-1, min=-1, max=64, step=1,
+                                       tooltip=TOP_K_TOOLTIP),
                     _seed_input(SEED_TOOLTIP),
-                    comfy_io.Int.Input("max_frame_side", default=DEFAULT_FRAME_SIDE, min=0, max=2048,
-                                       step=64, tooltip=FRAME_SIDE_TOOLTIP),
                     comfy_io.Int.Input("reserve_mib", default=0, min=0, max=524288, step=512,
                                        tooltip=RESERVE_TOOLTIP),
-                    comfy_io.Int.Input("extra_mib", default=0, min=0, max=262144, step=64,
-                                       tooltip=EXTRA_TOOLTIP),
                     comfy_io.Boolean.Input("clear_comfy_vram", default=False,
                                            tooltip=CLEAR_VRAM_TOOLTIP),
-                    comfy_io.String.Input("api_key", default="", tooltip=API_KEY_TOOLTIP),
-                    comfy_io.Int.Input("max_images", default=16, min=0, max=MAX_IMAGES_PER_PIN,
-                                       step=1, tooltip=MAX_IMAGES_TOOLTIP),
-                    comfy_io.Int.Input("max_video_frames", default=8, min=0,
-                                       max=MAX_VIDEO_FRAMES_PER_PIN, step=1,
-                                       tooltip=MAX_VIDEO_FRAMES_TOOLTIP),
-                    comfy_io.Int.Input("video_fps", default=0, min=0, max=240, step=1,
-                                       tooltip=VIDEO_FPS_TOOLTIP),
                     comfy_io.Autogrow.Input("images", template=image_template),
                     comfy_io.Autogrow.Input("videos", template=video_template),
                     comfy_io.Custom(PS_MEMORY).Input("memory", optional=True,
@@ -1277,10 +1284,12 @@ if _HAS_V3:
                                                              "разговора (multi-turn). Без неё - одиночный запрос. "
                                                              "В историю пишется только текст (медиа не попадают)."),
                     comfy_io.Custom(PS_SAMPLING).Input("sampling", optional=True,
-                                                       tooltip="Опционально: нода 'PolyStrata Sampling' - top_k, "
-                                                               "min_p, штрафы, stop, seed, logit_bias, extra_sampling "
-                                                               "(temperature/top_p/reasoning - виджеты этой ноды). "
-                                                               "Заданное в Sampling перекрывает виджеты чата."),
+                                                       tooltip="Опционально: нода 'PolyStrata Sampling' - "
+                                                               "min_p, штрафы, stop, logit_bias, extra_sampling "
+                                                               "(temperature/top_p/top_k/reasoning/seed - виджеты "
+                                                               "этой ноды). Заданное в Sampling перекрывает виджеты чата."),
+                    comfy_io.Custom(PS_MEDIA).Input("media", optional=True,
+                                                    tooltip=MEDIA_INPUT_TOOLTIP),
                 ],
                 outputs=[
                     comfy_io.String.Output(display_name="text"),
@@ -1323,7 +1332,6 @@ else:
                     "system_prompt_text": ("STRING", {"multiline": True, "default": "",
                                                       "tooltip": "Ручной системный промпт (роль system). "
                                                                  "Используется, если пресет = none."}),
-                    "model": ("STRING", {"default": "", "tooltip": "Имя модели; пусто = запущенная."}),
                     "reasoning": (["default", "none", "low", "medium", "high"],
                                   {"default": "default",
                                    "tooltip": "Размышления думающих моделей (Qwen/GLM/Gemma...).\n"
@@ -1337,23 +1345,13 @@ else:
                                               "tooltip": "Температура (0 = жадный)."}),
                     "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01,
                                         "tooltip": "Top-P (nucleus)."}),
+                    "top_k": ("INT", {"default": -1, "min": -1, "max": 64, "step": 1,
+                                      "tooltip": TOP_K_TOOLTIP}),
                     "seed": ("INT", {"default": 0, "min": 0, "max": 4294967295, "step": 1,
                                      "control_after_generate": True, "tooltip": SEED_TOOLTIP}),
-                    "max_frame_side": ("INT", {"default": DEFAULT_FRAME_SIDE, "min": 0, "max": 2048,
-                                               "step": 64, "tooltip": FRAME_SIDE_TOOLTIP}),
                     "reserve_mib": ("INT", {"default": 0, "min": 0, "max": 524288, "step": 512,
                                             "tooltip": RESERVE_TOOLTIP}),
-                    "extra_mib": ("INT", {"default": 0, "min": 0, "max": 262144, "step": 64,
-                                          "tooltip": EXTRA_TOOLTIP}),
                     "clear_comfy_vram": ("BOOLEAN", {"default": False, "tooltip": CLEAR_VRAM_TOOLTIP}),
-                    "api_key": ("STRING", {"default": "", "tooltip": API_KEY_TOOLTIP}),
-                    "max_images": ("INT", {"default": 16, "min": 0, "max": MAX_IMAGES_PER_PIN,
-                                           "step": 1, "tooltip": MAX_IMAGES_TOOLTIP}),
-                    "max_video_frames": ("INT", {"default": 8, "min": 0,
-                                                 "max": MAX_VIDEO_FRAMES_PER_PIN, "step": 1,
-                                                 "tooltip": MAX_VIDEO_FRAMES_TOOLTIP}),
-                    "video_fps": ("INT", {"default": 0, "min": 0, "max": 240, "step": 1,
-                                         "tooltip": VIDEO_FPS_TOOLTIP}),
                 },
                 "optional": {
                     "images": ("IMAGE", {"tooltip": "Картинки или кадры видео (IMAGE, можно батч). "
@@ -1363,6 +1361,7 @@ else:
                                                     "с метками времени '<X.X seconds>' между кадрами."}),
                     "memory": (PS_MEMORY, {"tooltip": "Опционально: нода 'PolyStrata Memory'."}),
                     "sampling": (PS_SAMPLING, {"tooltip": "Опционально: нода 'PolyStrata Sampling'."}),
+                    "media": (PS_MEDIA, {"tooltip": MEDIA_INPUT_TOOLTIP}),
                 },
             }
 
@@ -1386,13 +1385,13 @@ else:
 # ================================================================ нода: Sampling
 class PolyStrataSampling:
     """Тонкий сэмплинг для ноды Chat - ТОЛЬКО то, чего нет в виджетах чата
-    (temperature/top_p/reasoning/seed живут в ноде Chat, здесь их нет - без дубликатов).
+    (temperature/top_p/top_k/reasoning/seed живут в ноде Chat, здесь их нет - без дубликатов).
 
     Подключается выходом 'sampling' ко входу 'sampling' ноды Chat; заданные значения
     перекрывают виджеты чата, незаданные (-1/пусто) - пропускаются.
 
     Поля /v1/chat/completions PolyStrata (serve/server.py, check_request_sampling +
-    StrataEngine.sampling_keys): top_k (1..64), min_p, repetition_penalty (repeat_penalty),
+    StrataEngine.sampling_keys): min_p, repetition_penalty (repeat_penalty),
     penalty_last_n (repeat_last_n), presence_penalty, frequency_penalty, stop (до 4 строк),
     logit_bias (запрет токенов - как banned_tokens в llama-нодах).
     Семплеров xtc/dry/dynatemp/mirostat/tfs_z/typical_p/smoothing/top_n_sigma у движка НЕТ -
@@ -1402,9 +1401,6 @@ class PolyStrataSampling:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "top_k": ("INT", {"default": -1, "min": -1, "max": 64, "step": 1,
-                                  "tooltip": "-1 = не задано (действует чат/сервер); 1..64 "
-                                             "(движок ограничивает сверху 64)."}),
                 "min_p": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 1.0, "step": 0.01,
                                     "tooltip": "-1 = не задано; 0..1. Отсекает токены с вероятностью "
                                                "меньше min_p от максимума (альтернатива top_p)."}),
@@ -1434,16 +1430,14 @@ class PolyStrataSampling:
     RETURN_NAMES = ("sampling",)
     FUNCTION = "run"
     CATEGORY = "PolyStrata"
-    DESCRIPTION = ("Тонкий сэмплинг для ноды Chat (без дубликатов: temperature/top_p/reasoning/seed - "
-                   "в чате). -1/пусто = поле не задано. logit_bias - запрет токенов; "
-                   "extra_sampling - JSON-сквозняк для будущих полей движка.")
+    DESCRIPTION = ("Тонкий сэмплинг для ноды PolyStrata Chat (без дубликатов: temperature/top_p/"
+                   "top_k/reasoning/seed - в чате). -1/пусто = поле не задано. logit_bias - запрет "
+                   "токенов; extra_sampling - JSON-сквозняк для будущих полей движка.")
 
-    def run(self, top_k=-1, min_p=-1.0, repeat_penalty=-1.0, repeat_last_n=-1,
+    def run(self, min_p=-1.0, repeat_penalty=-1.0, repeat_last_n=-1,
             presence_penalty=-1.0, frequency_penalty=-1.0, stop="",
             logit_bias="", extra_sampling=""):
         out: dict = {}
-        if top_k is not None and int(top_k) >= 1:
-            out["top_k"] = int(top_k)
         if min_p is not None and 0 <= min_p <= 1:
             out["min_p"] = float(min_p)
         if repeat_penalty is not None and repeat_penalty > 0:
@@ -1469,6 +1463,54 @@ class PolyStrataSampling:
         shown = ", ".join(f"{k}={v}" for k, v in sorted(out.items())) or "все не заданы (умолчания сервера)"
         print(f"[PolyStrata] sampling: {shown}", flush=True)
         return (out,)
+
+
+# ================================================================ нода: Media
+class PolyStrataMedia:
+    """Опциональная субнода-оверрайд медиа-лимитов для ноды Chat: подключите выход 'media'
+    ко входу 'media' ноды Chat, чтобы задать лимиты кадров, ужатие стороны и метки времени
+    видео - чтобы не загромождать главную ноду. Без подключения Chat работает с дефолтами
+    (16 картинок/пин, 8 кадров/пин, сторона 1024, без меток времени).
+
+    Сентинелов нет: значения в субноде - реальные (по умолчанию те же, что и без неё),
+    меняйте только то, что нужно. Списки от list-паков на входе Chat нормализуются как у
+    всех входов (берётся первый элемент)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "max_frame_side": ("INT", {"default": DEFAULT_FRAME_SIDE, "min": 0, "max": 2048,
+                                           "step": 64, "tooltip": FRAME_SIDE_TOOLTIP}),
+                "max_images": ("INT", {"default": 16, "min": 0, "max": MAX_IMAGES_PER_PIN,
+                                       "step": 1, "tooltip": MAX_IMAGES_TOOLTIP}),
+                "max_video_frames": ("INT", {"default": 8, "min": 0,
+                                             "max": MAX_VIDEO_FRAMES_PER_PIN, "step": 1,
+                                             "tooltip": MAX_VIDEO_FRAMES_TOOLTIP}),
+                "video_fps": ("INT", {"default": 0, "min": 0, "max": 240, "step": 1,
+                                      "tooltip": VIDEO_FPS_TOOLTIP}),
+            },
+        }
+
+    RETURN_TYPES = (PS_MEDIA,)
+    RETURN_NAMES = ("media",)
+    FUNCTION = "run"
+    CATEGORY = "PolyStrata"
+    DESCRIPTION = ("Медиа-лимиты для ноды PolyStrata Chat: кадры на пин, ужатие длинной стороны, "
+                   "метки времени видео. Опциональная субнода: подключается ко входу 'media'; "
+                   "без неё у Chat значения по умолчанию.")
+
+    def run(self, max_frame_side=DEFAULT_FRAME_SIDE, max_images=16, max_video_frames=8,
+            video_fps=0):
+        self.max_frame_side = max(0, int(max_frame_side))
+        self.max_images = max(0, int(max_images))
+        self.max_video_frames = max(0, int(max_video_frames))
+        self.video_fps = max(0, int(video_fps))
+        print(f"[PolyStrata] media: сторона<={self.max_frame_side or 'без ужатия'}, "
+              f"картинок/пин<={self.max_images or 'все'}, "
+              f"кадров/пин<={self.max_video_frames or 'все'}, "
+              f"fps={self.video_fps or 'меток нет'}", flush=True)
+        return (self,)
 
 
 # ================================================================ нода: Memory
@@ -1575,7 +1617,6 @@ class PolyStrataUnload:
                                    "tooltip": "Сколько секунд ждать завершения активного запроса "
                                               "(до 300). 0 - если сервер чем-то занят, будет отказ 409 "
                                               "model_busy; поставьте 30-60, если генерация может ещё идти."}),
-                "api_key": ("STRING", {"default": "", "tooltip": API_KEY_TOOLTIP}),
             },
             "optional": {
                 "any_input": (ANY, {"tooltip": "Опционально: сквозной вход (вывод чат-ноды и т.п.) - задает "
@@ -1592,8 +1633,8 @@ class PolyStrataUnload:
                    "сброшен, EXTRA_RESERVED_VRAM ComfyUI восстановлен, сервер жив; следующий "
                    "запрос чата грузит модель сам. Сквозной вход/выход.")
 
-    def run(self, server, wait_s=0, api_key="", any_input=None):
-        client = PolyStrataClient(server, api_key)
+    def run(self, server, wait_s=0, any_input=None):
+        client = PolyStrataClient(server)
         try:
             out = client.unload(float(wait_s), stop_check=_throw_if_interrupted)
         except _Interrupted:
@@ -1631,6 +1672,7 @@ class PolyStrataUnload:
 NODE_CLASS_MAPPINGS = {
     "PolyStrataChat": PolyStrataChat,
     "PolyStrataSampling": PolyStrataSampling,
+    "PolyStrataMedia": PolyStrataMedia,
     "PolyStrataMemory": PolyStrataMemory,
     "PolyStrataUnload": PolyStrataUnload,
 }
@@ -1638,6 +1680,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PolyStrataChat": "PolyStrata Chat",
     "PolyStrataSampling": "PolyStrata Sampling",
+    "PolyStrataMedia": "PolyStrata Media",
     "PolyStrataMemory": "PolyStrata Memory",
     "PolyStrataUnload": "PolyStrata Unload (полная выгрузка)",
 }

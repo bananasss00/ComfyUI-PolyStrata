@@ -3,14 +3,12 @@
 Сервер запускается пользователем отдельно; ноды шлют запросы на его OpenAI-совместимый API
 и управляющие эндпоинты (/v1/vram, /v1/unload, /v1/status).
 
-Ноды (v7): Chat - SCHEMA V3 (comfy_api.latest) с динамическими autogrow-входами картинок
+Ноды (v8): Chat - SCHEMA V3 (comfy_api.latest) с динамическими autogrow-входами картинок
 (img_0, img_1, ...) и ОТДЕЛЬНО видео (vid_0, vid_1, ...), каждый vid-пин = отдельное видео:
-блок [Video N] + кадры по порядку, виджет video_fps вставляет между кадрами метки времени
-'<X.X seconds>' (формат llama.cpp при декоде видео: Jan шлёт видеофайл input_video, движок
-сам нарезает кадры с теми же метками; PolyStrata input_video не принимает - размечаем на
-ноде); reasoning/temperature/top_p/seed - в главной ноде, без дубликатов в
-Sampling. Выходы: text + thoughts. Лимиты max_images/max_video_frames - НА КАЖДЫЙ пин
-своего типа, кадры заранее подгоняются под контекст движка (двигок запросы не обрезает).
+блок [Video N] + кадры по порядку, video_fps (в субноде Media) вставляет между кадрами
+метки времени '<X.X seconds>' (формат llama.cpp при декоде видео); temperature/top_p/
+top_k/reasoning/seed - только в главной ноде, без дубликатов в Sampling. Выходы: text +
+thoughts. Кадры заранее подгоняются под контекст движка (двигок запросы не обрезает).
 Тоггл clear_comfy_vram: перед генерацией выгрузить модели САМОГО ComfyUI (как кнопка
 'Free model and node cache') - в одном запуске воркфлоу ОДИН РАЗ: лист картинок на входе,
 цикл list-паков, перебор сидов или несколько нод Chat исполняют ноду многократно, но
@@ -19,6 +17,10 @@ Sampling. Выходы: text + thoughts. Лимиты max_images/max_video_frame
 (list-паки) обрабатываются безопасно и без перечисления имён виджетов (универсальный
 нормализатор всего kwargs): скалярные виджеты берут первый элемент, списки
 картинок разворачиваются в пины.
+Компактный интерфейс (v0.8.0): виджетов model/api_key/extra_mib НЕТ - модель та, что
+запущена на сервере (поле 'model' не отправляется), доступ localhost, резерв - один
+reserve_mib; лимиты кадров (max_frame_side/max_images/max_video_frames/video_fps) -
+в опциональной субноде Media (вход 'media'; без неё - дефолты 1024/16/8/0).
 Interrupt (кнопка Cancel ComfyUI) прерывает генерацию: interruptible-запрос идёт через
 http.client, при срабатывании stop_check сокет закрывается ПО-НАСТОЯЩЕМУ (FIN) - watch-поток
 PolyStrata (_watch_client) видит EOF и отменяет генерацию движка
@@ -74,4 +76,4 @@ except ImportError:
     NODE_DISPLAY_NAME_MAPPINGS = _nodes.NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
-__version__ = "0.7.5"
+__version__ = "0.8.0"

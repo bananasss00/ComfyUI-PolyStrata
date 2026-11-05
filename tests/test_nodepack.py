@@ -7,7 +7,8 @@
 
 Архитектура v6: Chat - SCHEMA V3 (comfy_api.latest) с autogrow-входами img_* (картинки) и
 vid_* (видео, каждый пин = отдельное видео кадрами), выходы text+thoughts; reasoning/
-temperature/top_p/seed - ТОЛЬКО в чате; лимиты max_images/max_video_frames - НА КАЖДЫЙ
+temperature/top_p/top_k/seed - ТОЛЬКО в чате; лимиты кадров - в опциональной субноде
+Media (max_images/max_video_frames/max_frame_side/video_fps), действуют НА КАЖДЫЙ
 пин своего типа (0 = все кадры пина, потолки 64/128); кадры заранее подгоняются под
 контекст движка (/v1/status -> context.native), потому что двигок запросы не обрезает;
 reasoning=none -> reasoning_effort=none + chat_template_kwargs enable_thinking=false
@@ -17,10 +18,13 @@ throw_exception_if_processing_interrupted поллится во время за�
 (_watch_client) видит EOF и отменяет генерацию; Session.close() requests сокет
 висящего запроса не закрывал - сервер дорабатывал до конца, исправлено в 0.7.1);
 InterruptProcessingException наследует BaseException.
-Sampling - без temperature/top_p/reasoning/seed (они в чате), + logit_bias/extra_sampling;
-Memory; Unload (полная выгрузка + сброс серверного резерва + возврат EXTRA_RESERVED_VRAM
-ComfyUI, сквозная). Бронь VRAM для ComfyUI - метод llama.cpp-нод: фактическое потребление
-PolyStrata (status.machine.gpu.total_mib - vram_free_mib) + extra_mib -> EXTRA_RESERVED_VRAM.
+Sampling - без temperature/top_p/top_k/reasoning/seed (они в чате), + logit_bias/
+extra_sampling; Media - опц. субнода лимитов кадров; Memory; Unload (полная выгрузка +
+сброс серверного резерва + возврат EXTRA_RESERVED_VRAM ComfyUI, сквозная). У нод НЕТ
+виджетов model/api_key/extra_mib (v0.8.0): модель - запущенная на сервере (поле 'model'
+не отправляется), доступ localhost, резерв - один reserve_mib. Бронь VRAM для ComfyUI -
+метод llama.cpp-нод: фактическое потребление
+PolyStrata (status.machine.gpu.total_mib - vram_free_mib) -> EXTRA_RESERVED_VRAM.
 АВТО-ВЫГРУЗКА (механика llama.cpp-нод): Chat помечает сервер как используемый; хук на
 PromptExecutor.execute выгружает сервер-сироту (главная нода забайпашена - новый фронт шлёт
 BypassedNode__, старый mode=4 / открыт другой воркфлоу / ноды удалены); хук на
@@ -348,6 +352,18 @@ def make_fake_image_batch(n=2, h=48, w=72):
     return rng.random((n, h, w, 3), dtype=np.float32)
 
 
+def make_media(max_frame_side=1024, max_images=16, max_video_frames=8, video_fps=0):
+    """Субнода PolyStrataMedia с заданными лимитами (как после исполнения ноды).
+    Модуль берётся из sys.modules: в V1-секции пак перезагружен без comfy_api -
+    ленивый import вернёт актуальный экземпляр (PolyStrataMedia в обеих ветках общий)."""
+    import importlib as _il
+    nodes = _il.import_module("ComfyUI-PolyStrata.nodes")
+    m = nodes.PolyStrataMedia()
+    m.run(max_frame_side=max_frame_side, max_images=max_images,
+          max_video_frames=max_video_frames, video_fps=video_fps)
+    return m
+
+
 # ------------------------------------------------------------------ проверки
 FAILS = []
 
@@ -386,7 +402,8 @@ def main():
     # ---------- 1. импорт нодпака двумя способами ----------
     print("\n[1] Импорт пакета")
     pack = load_pack(as_package=True)
-    expected = {"PolyStrataChat", "PolyStrataSampling", "PolyStrataMemory", "PolyStrataUnload"}
+    expected = {"PolyStrataChat", "PolyStrataSampling", "PolyStrataMedia",
+                "PolyStrataMemory", "PolyStrataUnload"}
     check("NODE_CLASS_MAPPINGS (package-загрузка)", set(pack.NODE_CLASS_MAPPINGS) == expected,
           str(sorted(pack.NODE_CLASS_MAPPINGS)))
     import importlib as _il
@@ -397,7 +414,7 @@ def main():
     check("NODE_CLASS_MAPPINGS (старый загрузчик)", set(pack2.NODE_CLASS_MAPPINGS) == expected)
     check("нод Load/VRAM больше нет",
           not any(k for k in pack.NODE_CLASS_MAPPINGS if "Load" in k or "Vram" in k))
-    check("версия 0.7.5", getattr(pack, "__version__", "") == "0.7.5")
+    check("версия 0.8.0", getattr(pack, "__version__", "") == "0.8.0")
 
     samp_node = nodes_mod.PolyStrataSampling()
     mem_node = nodes_mod.PolyStrataMemory()
@@ -420,21 +437,25 @@ def main():
           tpl["images"].max == 50 and tpl["videos"].max == 50
           and tpl["images"].min == 0 and tpl["videos"].min == 0)
     check("видео-пины - тип IMAGE (батч кадров), не VIDEO", tpl["videos"].pin.kind == "IMAGE")
-    check("memory/sampling - кастомные типы PS_*",
+    check("memory/sampling/media - кастомные типы PS_*",
           ins["memory"].kw.get("type_id") == "PS_MEMORY"
-          and ins["sampling"].kw.get("type_id") == "PS_SAMPLING")
+          and ins["sampling"].kw.get("type_id") == "PS_SAMPLING"
+          and ins["media"].kw.get("type_id") == "PS_MEDIA")
     check("выходы text + thoughts",
           [o.name for o in outs] == ["text", "thoughts"])
     check("виджеты: reasoning/temperature/top_p в ГЛАВНОЙ ноде",
           all(n in ins for n in ("reasoning", "temperature", "top_p")))
-    check("виджеты: reserve_mib/extra_mib/max_images/max_video_frames/video_fps",
-          all(n in ins for n in ("reserve_mib", "extra_mib", "max_images", "max_video_frames",
-                                 "video_fps")))
-    check("виджеты: seed и max_frame_side - тоже в ГЛАВНОЙ ноде",
-          all(n in ins for n in ("seed", "max_frame_side")))
-    check("виджеты server/prompt/system_prompt_preset/system_prompt_text/model/api_key",
+    check("виджеты: reserve_mib и clear_comfy_vram в ГЛАВНОЙ ноде",
+          "reserve_mib" in ins and "clear_comfy_vram" in ins)
+    check("виджет top_k - в чате ПОСЛЕ top_p (переехал из Sampling)",
+          "top_k" in ins and list(ins).index("top_p") < list(ins).index("top_k"))
+    check("виджет seed - тоже в ГЛАВНОЙ ноде", "seed" in ins)
+    check("виджеты server/prompt/system_prompt_preset/system_prompt_text",
           all(n in ins for n in ("server", "prompt", "system_prompt_preset",
-                                 "system_prompt_text", "model", "api_key")))
+                                 "system_prompt_text")))
+    check("мусор v0.7 вычищен: НЕТ model/api_key/extra_mib и медиа-лимитов в чате",
+          not ({"model", "api_key", "extra_mib", "max_frame_side", "max_images",
+                "max_video_frames", "video_fps"} & set(ins)))
     check("пресет: список опций начинается с 'none' и содержит .txt из models/LLM/prompts",
           ins["system_prompt_preset"].kw["options"][0] == nodes_mod.NO_SYSTEM_PROMPT
           and isinstance(ins["system_prompt_preset"].kw["options"], list))
@@ -444,8 +465,9 @@ def main():
     s = samp_node.INPUT_TYPES()["required"]
     check("в Sampling НЕТ temperature/top_p/reasoning",
           not ({"temperature", "top_p", "reasoning"} & set(s)), str(sorted(s)))
-    check("в Sampling есть top_k/min_p/штрафы/stop",
-          {"top_k", "min_p", "repeat_penalty", "repeat_last_n", "presence_penalty",
+    check("в Sampling НЕТ top_k (переехал в чат)", "top_k" not in s, str(sorted(s)))
+    check("в Sampling есть min_p/штрафы/stop",
+          {"min_p", "repeat_penalty", "repeat_last_n", "presence_penalty",
            "frequency_penalty", "stop"} <= set(s))
     check("в Sampling НЕТ seed (он переехал в ноду Chat)", "seed" not in s, str(sorted(s)))
     check("в Sampling есть logit_bias и extra_sampling",
@@ -455,13 +477,13 @@ def main():
           "xtc" in tt and "extra_sampling" in tt)
     check("тултипы НЕ просят добавлять vram_elastic", "добавьте" not in tt)
 
-    out, log = capture(samp_node.run, top_k=20, min_p=0.05, repeat_penalty=1.1, repeat_last_n=64,
+    out, log = capture(samp_node.run, min_p=0.05, repeat_penalty=1.1, repeat_last_n=64,
                        presence_penalty=0.3, frequency_penalty=0.7, stop="КОНЕЦ\nДОВОЛЬНО\n",
                        logit_bias="12345\n678:-2.5\n# комментарий\n999 = 1.5",
                        extra_sampling='{"xtc_probability": 0.5}')
     smp = out[0]
     check("заданные поля в словаре, sentinel -1 выброшен",
-          smp.get("top_k") == 20 and smp.get("min_p") == 0.05 and smp.get("repeat_penalty") == 1.1
+          smp.get("top_k") is None and smp.get("min_p") == 0.05 and smp.get("repeat_penalty") == 1.1
           and smp.get("repeat_last_n") == 64 and smp.get("presence_penalty") == 0.3
           and smp.get("frequency_penalty") == 0.7 and smp.get("stop") == ["КОНЕЦ", "ДОВОЛЬНО"],
           str(smp))
@@ -481,6 +503,23 @@ def main():
     except nodes_mod.PolyStrataError:
         check("extra_sampling: не объект -> ошибка", True)
 
+    # ---------- 3b. Media: опциональная субнода медиа-лимитов (без сентинелов) ----------
+    print("\n[3b] Media: субнода-оверрайд лимитов кадров для Chat")
+    mi = nodes_mod.PolyStrataMedia.INPUT_TYPES()["required"]
+    check("Media: ровно 4 виджета",
+          set(mi) == {"max_frame_side", "max_images", "max_video_frames", "video_fps"},
+          str(sorted(mi)))
+    check("Media: дефолты = реальные значения (1024/16/8/0), без сентинелов",
+          mi["max_frame_side"][1]["default"] == 1024 and mi["max_images"][1]["default"] == 16
+          and mi["max_video_frames"][1]["default"] == 8 and mi["video_fps"][1]["default"] == 0)
+    media_node = nodes_mod.PolyStrataMedia()
+    out, log = capture(media_node.run, max_frame_side=512, max_images=0, max_video_frames=3,
+                       video_fps=2)
+    md = out[0]
+    check("Media run -> объект с атрибутами",
+          (md.max_frame_side, md.max_images, md.max_video_frames, md.video_fps)
+          == (512, 0, 3, 2), str(vars(md)))
+
     # ---------- 4. Chat V3: одиночный запрос ----------
     print("\n[4] Chat V3 - одиночный запрос (execute)")
     ST.sleeping = False
@@ -492,6 +531,7 @@ def main():
     req = ST.last_chat
     check("stream=False", req.get("stream") is False)
     check("max_tokens передан", req.get("max_tokens") == 256)
+    check("поле 'model' НЕ отправляется (модель - запущенная на сервере)", "model" not in req)
     check("system+user сообщения", [m["role"] for m in req["messages"]] == ["system", "user"])
     check("content строкой (без медиа)", isinstance(req["messages"][-1]["content"], str))
     check("temperature/top_p от виджетов", req.get("temperature") == 0.5 and req.get("top_p") == 0.9)
@@ -511,6 +551,8 @@ def main():
     check("seed из виджета чата уходит в запрос", ST.last_chat.get("seed") == 4242)
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="x")
     check("seed=0 (случайный) не отправляется", "seed" not in ST.last_chat)
+    out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="x", top_k=33)
+    check("top_k из виджета чата уходит в запрос", ST.last_chat.get("top_k") == 33)
 
     # ---------- 5. Chat V3: картинки и видео РАЗДЕЛЬНО ----------
     print("\n[5] Chat V3 - autogrow: img_* и vid_* отдельно")
@@ -519,7 +561,7 @@ def main():
     vid_a = make_fake_image_batch(8)          # vid_0: 8 кадров
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="Опиши.",
                      images={"img_0": img_a, "img_1": img_b}, videos={"vid_0": vid_a},
-                     max_images=0, max_video_frames=4)
+                     media=make_media(max_images=0, max_video_frames=4))
     req = ST.last_chat
     texts = text_parts(req)
     check("метки картинок сквозные [Image 1..3]",
@@ -534,7 +576,7 @@ def main():
     # Лимит max_images НА КАЖДЫЙ пин: 2 пина по 8 кадров, лимит 3 -> 3+3 = 6
     out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
                      images={"img_0": make_fake_image_batch(8), "img_1": make_fake_image_batch(8)},
-                     videos=None, max_images=3, max_video_frames=0)
+                     videos=None, media=make_media(max_images=3, max_video_frames=0))
     texts = text_parts(ST.last_chat)
     check("max_images=3 НА КАЖДЫЙ из 2 пинов -> 6 кадров (3+3)",
           len(media_parts(ST.last_chat)) == 6, str(len(media_parts(ST.last_chat))))
@@ -543,14 +585,14 @@ def main():
     out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
                      images=None, videos={"vid_0": make_fake_image_batch(2),
                                           "vid_1": make_fake_image_batch(2)},
-                     max_images=0, max_video_frames=8)
+                     media=make_media(max_video_frames=8))
     texts = text_parts(ST.last_chat)
     check("два видео-пина -> [Video 1]/[Video 2]",
           "[Video 1]" in texts and "[Video 2]" in texts, str(texts))
     out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
                      images=None, videos={"vid_0": make_fake_image_batch(12),
                                           "vid_1": make_fake_image_batch(12)},
-                     max_images=0, max_video_frames=8)
+                     media=make_media(max_video_frames=8))
     texts = text_parts(ST.last_chat)
     check("max_video_frames=8 НА КАЖДЫЙ видео-пин -> 8+8=16 кадров",
           "[Video 1]" in texts and "[Video 2]" in texts
@@ -560,13 +602,13 @@ def main():
     # Метки времени видео ('<X.X seconds>' - формат llama.cpp при декоде видео, mtmd-helper)
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
                      images=None, videos={"vid_0": make_fake_image_batch(12)},
-                     max_images=0, max_video_frames=6, video_fps=0)
+                     media=make_media(max_images=0, max_video_frames=6, video_fps=0))
     texts = text_parts(ST.last_chat)
     check("video_fps=0 - без меток времени", not any(t.endswith("seconds>") for t in texts),
           str(texts))
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
                      images=None, videos={"vid_0": make_fake_image_batch(12)},
-                     max_images=0, max_video_frames=6, video_fps=2)
+                     media=make_media(max_images=0, max_video_frames=6, video_fps=2))
     texts = text_parts(ST.last_chat)
     marks = [t for t in texts if t.endswith("seconds>")]
     check("video_fps=2 - метки от ИСХОДНЫХ индексов (0,2,4,7,9,11)/2",
@@ -579,7 +621,8 @@ def main():
     check("каждая метка стоит прямо перед своим кадром",
           len(mark_pos) == 6 and all(m + 1 in img_pos for m in mark_pos), str(mark_pos))
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
-                     images={"img_0": make_fake_image_batch(3)}, videos=None, video_fps=2)
+                     images={"img_0": make_fake_image_batch(3)}, videos=None,
+                     media=make_media(video_fps=2))
     texts = text_parts(ST.last_chat)
     check("video_fps не ставит метки на картинки", not any(t.endswith("seconds>") for t in texts),
           str(texts))
@@ -593,16 +636,16 @@ def main():
     nodes_mod._SERVER_CTX_CACHE.clear()
     ST.ctx_n = 700                            # кадр 48x72 ~ 18 ток. (с overhead); room = 700-1-128-512 = 59
     out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
-                       videos={"vid_0": make_fake_image_batch(8)}, max_video_frames=8,
-                       max_tokens=0)
+                       videos={"vid_0": make_fake_image_batch(8)},
+                       media=make_media(max_video_frames=8), max_tokens=0)
     check("контекст 700: 8 кадров -> урезано до 3", len(media_parts(ST.last_chat)) == 3,
           str(len(media_parts(ST.last_chat))))
     check("в логе заметка о подгонке 'кадров 8 -> 3'", "кадров 8 -> 3" in log, log)
     nodes_mod._SERVER_CTX_CACHE.clear()
     ST.ctx_n = 1400                           # текст 5000 симв ~ 1429 ток. -> room < 0
     out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж" * 5000,
-                       videos={"vid_0": make_fake_image_batch(4)}, max_video_frames=4,
-                       max_tokens=0)
+                       videos={"vid_0": make_fake_image_batch(4)},
+                       media=make_media(max_video_frames=4), max_tokens=0)
     check("текст занимает всё окно -> кадры убраны", len(media_parts(ST.last_chat)) == 0,
           str(len(media_parts(ST.last_chat))))
     check("в логе 'все кадры убраны'", "все кадры убраны" in log or "кадров 4 -> 0" in log, log)
@@ -671,14 +714,14 @@ def main():
 
     # ---------- 6. Sampling подключён к Chat: перекрытие + passthrough ----------
     print("\n[6] Sampling -> Chat: перекрытие и сквозная передача полей")
-    smp = samp_node.run(top_k=33, min_p=0.1, repeat_penalty=1.15, repeat_last_n=128,
+    smp = samp_node.run(min_p=0.1, repeat_penalty=1.15, repeat_last_n=128,
                         presence_penalty=0.2, frequency_penalty=-1.0, stop="СТОП",
                         logit_bias="42\n", extra_sampling='{"top_n_sigma": 1.0}')[0]
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ч",
                      temperature=0.8, top_p=0.95, reasoning="none", seed=9, sampling=smp)
     req = ST.last_chat
-    check("top_k/min_p/repeat/repeat_last_n ушли",
-          req.get("top_k") == 33 and req.get("min_p") == 0.1
+    check("min_p/repeat/repeat_last_n ушли (top_k в Sampling больше нет)",
+          req.get("top_k") is None and req.get("min_p") == 0.1
           and req.get("repetition_penalty") == 1.15 and req.get("penalty_last_n") == 128)
     check("presence/frequency/stop ушли; seed - из виджета чата",
           req.get("presence_penalty") == 0.2 and req.get("frequency_penalty") is None
@@ -752,25 +795,25 @@ def main():
     check("Memory тоже берёт пресет", out[0].system_line() == "СВЕЖИЙ ПРЕСЕТ")
 
     # ---------- 8. reserve VRAM -> EXTRA_RESERVED_VRAM (метод llama-нод) ----------
-    print("\n[8] reserve VRAM: фактическое потребление + extra -> EXTRA_RESERVED_VRAM")
+    print("\n[8] reserve VRAM: фактическое потребление -> EXTRA_RESERVED_VRAM")
     MM_STUB.EXTRA_RESERVED_VRAM = 600 * 1024 * 1024
     ST.sleeping = False
     ST.last_vram = None
     out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="ж",
-                       reserve_mib=8000, extra_mib=100)
-    check("/v1/vram вызван с reserve+extra = 8100", ST.last_vram.get("reserve_mib") == 8100,
-          str(ST.last_vram))
-    # мок: freed = min(8100, 4000) = 4000, free = 4700, total = 32608 -> held = 27908
+                       reserve_mib=8000)
+    check("/v1/vram вызван с reserve = 8000 (extra_mib больше нет)",
+          ST.last_vram.get("reserve_mib") == 8000, str(ST.last_vram))
+    # мок: freed = min(8000, 4000) = 4000, free = 4700, total = 32608 -> held = 27908
     held = TOTAL_GPU_MIB - 4700
-    want = (held + 100) * 1048576
-    check("EXTRA_RESERVED_VRAM = (total - факт.свободно) + extra_mib",
+    want = held * 1048576
+    check("EXTRA_RESERVED_VRAM = (total - факт.свободно)",
           MM_STUB.EXTRA_RESERVED_VRAM == want,
           f"{MM_STUB.EXTRA_RESERVED_VRAM / 1048576:.0f} != {want / 1048576:.0f} MiB")
     check("в логе: 'PolyStrata держит ... MiB; ComfyUI: EXTRA_RESERVED_VRAM = ...'",
           "PolyStrata держит" in log and "EXTRA_RESERVED_VRAM" in log)
-    check("в логе ЧАСТИЧНОЕ ОСВОБОЖДЕНИЕ (8100 > 4000 экспертов)", "ЧАСТИЧНОЕ" in log)
+    check("в логе ЧАСТИЧНОЕ ОСВОБОЖДЕНИЕ (8000 > 4000 экспертов)", "ЧАСТИЧНОЕ" in log)
     check("запрошенная цель НЕ записана в EXTRA (16000-подобные цифры не попадают)",
-          MM_STUB.EXTRA_RESERVED_VRAM != 8100 * 1048576)
+          MM_STUB.EXTRA_RESERVED_VRAM != 8000 * 1048576)
     # снятие брони - нодой Unload
     out, _ = capture(unload_node.run, server=server, wait_s=1, any_input="СКВОЗНОЙ")
     check("Unload: сквозной выход", out["result"] == ("СКВОЗНОЙ",))
@@ -909,7 +952,7 @@ def main():
         out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="много картинок",
                          clear_comfy_vram=True,
                          images={"img_0": make_fake_image_batch(4), "img_1": make_fake_image_batch(3)},
-                         max_images=0)
+                         media=make_media(max_images=0))
         check("батч 4+3 картин за один запрос = одна очистка",
               len(media_parts(ST.last_chat)) == 7 and MM_STUB.unload_calls["n"] == n2,
               f"frames={len(media_parts(ST.last_chat))}, unloads={MM_STUB.unload_calls['n'] - n2}")
@@ -939,7 +982,8 @@ def main():
     check("server-список -> первый адрес, запрос прошёл",
           out[1][0] == "МОК-ОТВЕТ: всё вижу.", str(out[1]))
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="жс3",
-                     images=[make_fake_image_batch(2), make_fake_image_batch(3)], max_images=0)
+                     images=[make_fake_image_batch(2), make_fake_image_batch(3)],
+                     media=make_media(max_images=0))
     texts = text_parts(ST.last_chat)
     check("images-СПИСОК батчей -> все кадры одним запросом (2+3=5)",
           len(media_parts(ST.last_chat)) == 5, str(len(media_parts(ST.last_chat))))
@@ -951,25 +995,25 @@ def main():
     check("memory-список -> история используется (первый элемент)",
           req["messages"][0]["content"] == "СИСТЕМА" and store.turns() == 2,
           f"{req['messages'][0]['content']!r}, turns={store.turns()}")
-    check("sampling-список -> параметры уходят (top_k из суб-ноды)",
-          req.get("top_k") == 33, str(req.get("top_k")))
+    check("sampling-список -> параметры уходят (min_p из суб-ноды)",
+          req.get("min_p") == 0.1, str(req.get("min_p")))
     # --- универсальная нормализация (_scalars): списки СРАЗУ во ВСЕХ скалярных виджетах.
     # Имена нигде не перечисляются - весь kwargs прогоняется через нормализатор, так что
     # покрытие полное и распространяется на любые будущие виджеты без правок кода
     out, log = capture(nodes_mod.PolyStrataChat.execute,
-                       server=[server], api_key=[""], model=[""], prompt=["списки везде"],
+                       server=[server], prompt=["списки везде"],
                        reasoning=["none"], max_tokens=[64], temperature=[0.5], top_p=[0.9],
-                       seed=[7], reserve_mib=[0], extra_mib=[0], max_images=[0],
-                       max_video_frames=[0], max_frame_side=[512], video_fps=[0],
+                       top_k=[33], seed=[7], reserve_mib=[0],
                        system_prompt_preset=["none"], system_prompt_text=[""],
-                       clear_comfy_vram=[False])
+                       clear_comfy_vram=[False], media=[make_media(max_frame_side=512)])
     req = ST.last_chat
     check("списки во ВСЕХ скалярных виджетах сразу -> первые элементы, запрос прошёл",
           req["messages"][-1]["content"] == "списки везде" and req.get("seed") == 7
           and req.get("max_tokens") == 64 and req.get("temperature") == 0.5
-          and req.get("reasoning_effort") == "none"
+          and req.get("reasoning_effort") == "none" and req.get("top_k") == 33
           and out[1][0] == "МОК-ОТВЕТ: всё вижу.",
-          str({k: req.get(k) for k in ("seed", "max_tokens", "temperature", "reasoning_effort")}))
+          str({k: req.get(k) for k in ("seed", "max_tokens", "temperature", "reasoning_effort",
+                                       "top_k")}))
 
     # ---------- 9. Unload ----------
     print("\n[9] Unload: 409 без wait, выгрузка, сброс серверного резерва")
@@ -1002,9 +1046,12 @@ def main():
         cin = nv1.PolyStrataChat.INPUT_TYPES()
         check("V1: входы images/videos (IMAGE) отдельно",
               cin["optional"]["images"][0] == "IMAGE" and cin["optional"]["videos"][0] == "IMAGE")
-        check("V1: seed/max_frame_side/video_fps тоже в чате",
-              "seed" in cin["required"] and "max_frame_side" in cin["required"]
-              and "video_fps" in cin["required"])
+        check("V1: seed и top_k в чате, model/api_key/extra_mib/медиа-лимитов НЕТ",
+              "seed" in cin["required"] and "top_k" in cin["required"]
+              and not ({"model", "api_key", "extra_mib", "max_frame_side", "max_images",
+                        "max_video_frames", "video_fps"} & set(cin["required"])))
+        check("V1: media - опциональный вход PS_MEDIA",
+              cin["optional"]["media"][0] == nodes_mod.PS_MEDIA)
         check("V1: пресеты тоже есть (system_prompt_preset/system_prompt_text)",
               "system_prompt_preset" in cin["required"]
               and "system_prompt_text" in cin["required"])
@@ -1015,13 +1062,14 @@ def main():
         check("V1: выходы text+thoughts", nv1.PolyStrataChat.RETURN_TYPES == ("STRING", "STRING"))
         v1 = nv1.PolyStrataChat()
         out, _ = capture(v1.generate, server=server, prompt="V1-тест", seed=77,
-                         videos=make_fake_image_batch(2), max_video_frames=2)
+                         videos=make_fake_image_batch(2), media=make_media(max_video_frames=2))
         check("V1 generate работает", out == ("МОК-ОТВЕТ: всё вижу.", ST.thoughts), str(out))
         check("V1: seed из виджета чата ушёл", ST.last_chat.get("seed") == 77)
         texts = text_parts(ST.last_chat)
         check("V1: видео тоже блоком [Video 1]", "[Video 1]" in texts, str(texts))
         out, _ = capture(v1.generate, server=server, prompt="V1-fps",
-                         videos=make_fake_image_batch(12), max_video_frames=6, video_fps=2)
+                         videos=make_fake_image_batch(12),
+                         media=make_media(max_video_frames=6, video_fps=2))
         texts = text_parts(ST.last_chat)
         check("V1: video_fps -> метки '<X.X seconds>' в запросе",
               [t for t in texts if t.endswith("seconds>")] ==
@@ -1047,7 +1095,7 @@ def main():
         # V1: листы на входах тоже обрабатываются
         out, _ = capture(v1.generate, server=server, prompt=["V1-лист", "второй"],
                          seed=[55, 66], images=[make_fake_image_batch(2), make_fake_image_batch(1)],
-                         max_images=0)
+                         media=make_media(max_images=0))
         check("V1: prompt/seed-листы -> первые элементы",
               ST.last_chat.get("seed") == 55
               and text_parts(ST.last_chat)[0] == "V1-лист",
