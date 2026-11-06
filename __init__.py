@@ -17,10 +17,16 @@ thoughts. Кадры заранее подгоняются под контекс
 (list-паки) обрабатываются безопасно и без перечисления имён виджетов (универсальный
 нормализатор всего kwargs): скалярные виджеты берут первый элемент, списки
 картинок разворачиваются в пины.
-Компактный интерфейс (v0.8.0): виджетов model/api_key/extra_mib НЕТ - модель та, что
-запущена на сервере (поле 'model' не отправляется), доступ localhost, резерв - один
-reserve_mib; лимиты кадров (max_frame_side/max_images/max_video_frames/video_fps) -
-в опциональной субноде Media (вход 'media'; без неё - дефолты 1024/16/8/0).
+Компактный интерфейс (v0.8.0): виджетов api_key/extra_mib НЕТ - доступ localhost,
+резерв - один reserve_mib; лимиты кадров (max_frame_side/max_images/max_video_frames/
+video_fps) - в опциональной субноде Media (вход 'media'; без неё - дефолты 1024/16/8/0).
+
+Смена модели (v0.9.0): виджет model в ноде Chat - дропдаун установленных моделей сервера
+(GET /api/models - реестр strata-*.json; перечитывается при КАЖДОМ построении ноды,
+поэтому F5 / R в ComfyUI дают свежий список, кеш 15 c). Сентинел 'как на сервере' -
+не влиять (поле 'model' в запрос не пишется, как в v0.8.0); выбранная модель, если не
+текущая, ПЕРЕКЛЮЧАЕТ сервер до генерации (POST /api/models/load): текущий движок
+останавливается, новая грузится по СВОЕМУ конфигу strata-<модель>.json.
 Interrupt (кнопка Cancel ComfyUI) прерывает генерацию: interruptible-запрос идёт через
 http.client, при срабатывании stop_check сокет закрывается ПО-НАСТОЯЩЕМУ (FIN) - watch-поток
 PolyStrata (_watch_client) видит EOF и отменяет генерацию движка
@@ -76,4 +82,4 @@ except ImportError:
     NODE_DISPLAY_NAME_MAPPINGS = _nodes.NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
-__version__ = "0.8.0"
+__version__ = "0.9.0"

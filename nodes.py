@@ -34,9 +34,18 @@
   PolyStrata Unload   - полная выгрузка модели (POST /v1/unload). Сквозная. Возвращает
                         ComfyUI исходное EXTRA_RESERVED_VRAM (бронь снимается).
 
-Компактность (v0.8.0): у нод НЕТ виджетов model/api_key/extra_mib и медиа-лимитов - модель
-та, что запущена на сервере (поле 'model' не отправляется), доступ localhost, резерв - один
-reserve_mib, лимиты кадров - в опциональной субноде Media (top_k переехал в Chat после top_p).
+Компактность (v0.8.0): у нод НЕТ виджетов api_key/extra_mib и медиа-лимитов - доступ
+localhost, резерв - один reserve_mib, лимиты кадров - в опциональной субноде Media
+(top_k переехал в Chat после top_p).
+
+Смена модели (v0.9.0): виджет model в главной ноде - дропдаун УСТАНОВЛЕННЫХ моделей
+сервера (GET /api/models, реестр strata-*.json в корне установки PolyStrata; список
+перечитывается при каждом построении ноды - F5 / R перезапрашивают /object_info,
+кеш 15 c). Сентинел 'как на сервере' - поведение v0.8.0 (не влиять, поле 'model' в
+chat-запрос НЕ пишется). Выбранная модель, если она не текущая, ПЕРЕКЛЮЧАЕТ сервер
+ДО генерации (POST /api/models/load): текущий движок останавливается, новая грузится
+по СВОЕМУ конфигу strata-<модель>.json (первый старт - минуты); идущая генерация
+дорабатывает (сервер ждёт до 120 c), Cancel переключение НЕ обрывает.
 
 Резерв VRAM для ComfyUI (reserve_mib в Chat) - логика update_global_vram_reservation
 из llama.cpp-нод (LlamaCPP-Subprocess): фактическое потребление PolyStrata (total GPU -
@@ -65,6 +74,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -233,6 +243,37 @@ MEDIA_WARN_FRAMES = 100        # предупреждение, если сумм
 SERVER_TOOLTIP = (
     "IP:порт сервера PolyStrata, например 127.0.0.1:8080 (порт можно опустить - подставится 8080).\n"
     "Сервер вы запускаете САМИ (run-<модель>.bat / START-HERE.bat); ноды только шлют запросы."
+)
+
+# ================================================================ смена модели (v0.9.0)
+# Сервер PolyStrata умеет менять модель НА ЛЕТУ (serve/server.py Service.switch_model,
+# реестр установленных моделей serve/models.py - strata-*.json в корне установки):
+#   GET  /api/models       -> установленные модели + текущая (перечитывается КАЖДЫЙ раз,
+#                             свежий strata-<имя>.json подхватывается без перезапуска);
+#   POST /api/models/load  -> переключить: текущий движок останавливается, новая модель
+#                             грузится по СВОЕМУ конфигу (первый старт - минуты).
+# Виджет model в главной ноде: сентинел 'как на сервере' = поведение v0.8.0 (не влиять,
+# поле 'model' в chat-запрос НЕ пишется); выбранная модель, если не текущая, переключает
+# сервер перед генерацией. Дропдаун строится по серверу по умолчанию + серверам этой
+# сессии: INPUT_TYPES не видит значения чужих виджетов (адрес server неизвестен) - поэтому
+# список = объединение; после первого запуска воркфлоу (сервер отмечен ACTIVE_SERVERS)
+# и F5/R (/object_info перечитывается) дропдаун показывает модели вашего сервера.
+MODEL_SWITCH_OFF = "как на сервере"   # сентинел: не менять модель (default)
+_MODEL_LIST_TTL = 15.0                # кеш списка моделей (c): F5/R частые - не дёргаем сервер
+_MODEL_LIST_CACHE: dict = {}          # base сервера -> (monotonic, [id моделей])
+
+MODEL_TOOLTIP = (
+    "Модель сервера PolyStrata. '" + MODEL_SWITCH_OFF + "' (по умолчанию) - НЕ влиять: "
+    "генерация идёт загруженной на сервере моделью, поле 'model' в запрос не пишется.\n"
+    "Выбранная модель, если она не текущая, ПЕРЕКЛЮЧАЕТ сервер ПЕРЕД генерацией "
+    "(POST /api/models/load): текущий движок останавливается (VRAM/RAM освобождаются), "
+    "новая грузится по СВОЕМУ конфигу strata-<модель>.json - первый старт идёт минуты "
+    "(в консоли сервера '[strata] switching the model: ...'). Идущая генерация "
+    "дорабатывает (сервер ждёт до 120 c), переключение кнопкой Cancel НЕ обрывается.\n"
+    "Список - УСТАНОВЛЕННЫЕ на сервере модели (GET /api/models, реестр strata-*.json); "
+    "обновляется перезагрузкой страницы браузера (F5) или клавишей R в ComfyUI "
+    "(кеш 15 c). Новая модель = положить strata-<имя>.json рядом с остальными - "
+    "сервер подхватывает сам, без перезапуска."
 )
 
 ELASTIC_NOTE = (
@@ -1011,13 +1052,115 @@ def _server_ctx(client: PolyStrataClient) -> int:
         return 0
 
 
+# ---------------------------------------------------------- список моделей (дропдаун)
+def _server_model_ids(server: str) -> list:
+    """id установленных моделей ОДНОГО сервера (для дропдауна), с кешем _MODEL_LIST_TTL.
+    Порядок - как отдаёт сервер (по id); недоступные (status unavailable - битые конфиги)
+    скрыты. Сервер не отвечает / старый без /api/models -> пусто; исключения ГЛОТАЮТСЯ:
+    построение ноды (/object_info) не должно падать из-за чужого сервера. Короткий таймаут
+    (2 c connect / 8 c read), чтобы F5/R не подвисали на недоступном адресе."""
+    try:
+        client = PolyStrataClient(str(server or ""), "")
+    except Exception:
+        return []
+    now = time.monotonic()
+    cached = _MODEL_LIST_CACHE.get(client.base)
+    if cached and now - cached[0] < _MODEL_LIST_TTL:
+        return list(cached[1])
+    ids: list = []
+    try:
+        body = client.models(timeout=(2, 8))
+        for e in body.get("models") or []:
+            if isinstance(e, dict) and e.get("id") and e.get("status") != "unavailable":
+                ids.append(str(e["id"]))
+    except Exception:
+        ids = []
+    if not ids:                             # старый сервер без /api/models: хотя бы текущая
+        try:
+            cur = str((client.status() or {}).get("model") or "")
+            ids = [cur] if cur else []
+        except Exception:
+            pass
+    _MODEL_LIST_CACHE[client.base] = (now, ids)
+    return list(ids)
+
+
+def _model_combo_options() -> list:
+    """Опции дропдауна model: сентинел + id моделей, известные на момент построения ноды.
+    INPUT_TYPES/define_schema НЕ видят значений чужих виджетов (адрес server неизвестен
+    при построении схемы), поэтому список собирается по: серверу по умолчанию
+    (127.0.0.1:8080) + ВСЕМ серверам этой сессии (ACTIVE_SERVERS - попадают туда после
+    первого запуска воркфлоу). F5 / R перечитывают /object_info -> свежий дропдаун
+    (кеш 15 c). Несколько серверов -> объединение списков: модель чужого сервера даст
+    понятную 404-ошибку при выборе (сервер перечислит свои имена)."""
+    servers = {"127.0.0.1:8080"}
+    with _AUTO_LOCK:
+        servers.update(s.removeprefix("http://") for s in ACTIVE_SERVERS)
+    out: list = []
+    seen = set()
+    for s in sorted(servers):
+        for mid in _server_model_ids(s):
+            if mid not in seen and mid != MODEL_SWITCH_OFF:
+                seen.add(mid)
+                out.append(mid)
+    return [MODEL_SWITCH_OFF] + out
+
+
+def _ensure_model(client: PolyStrataClient, name: str) -> str:
+    """Убедиться, что на сервере загружена модель name; если нет - ПЕРЕКЛЮЧИТЬ
+    (POST /api/models/load): текущий движок останавливается (VRAM/RAM освобождаются),
+    новая грузится по СВОЕМУ конфигу strata-<модель>.json (первый старт - минуты).
+    Сервер ждёт окончания идущих запросов до 120 c, затем 409. Совпадение имён - id,
+    имя конфига или уникальное подстрочное вхождение; ЛОЖНОЕ срабатывание (выбран алиас
+    текущей) безвредно: сервер видит, что она уже текущая, и просто будит её (load).
+    Возвращает заметку для лога ('' - переключение не требовалось).
+    Переключение НЕ обрывается Cancel: это состояние СЕРВЕРА, доводим до конца (исключение
+    после Cancel долетит выше, но сервер останется в согласованном состоянии). Кеш окна
+    контекста сбрасывается (у новой модели оно своё); бронь VRAM ComfyUI обновляется по
+    факту, но ТОЛЬКО если нодпак ей уже управлял (reserve_mib/Unload) - при reserve_mib=0
+    память ComfyUI не трогаем, как и в v0.8.0."""
+    want = str(name or "").strip()
+    cur = ""
+    try:
+        cur = str((client.models() or {}).get("current") or "")
+    except PolyStrataError:
+        try:
+            cur = str((client.status() or {}).get("model") or "")   # старый сервер
+        except PolyStrataError:
+            cur = ""
+    if cur and want.lower() == cur.lower():
+        return ""                         # уже загружена - не трогаем сервер
+    print(f"[PolyStrata] смена модели: '{cur or '?'}' -> '{want}' (сервер выгрузит текущую "
+          f"и загрузит новую по её конфигу strata-*.json; первый старт - минуты)", flush=True)
+    out = client.switch_model(want)        # без stop_check: доводим до конца
+    entry = out.get("model") if isinstance(out.get("model"), dict) else {}
+    new_id = str(entry.get("id") or "")
+    _SERVER_CTX_CACHE.pop(client.base, None)          # окно у новой модели своё
+    note = f"модель переключена на {new_id or want}"
+    comfy_note = ""
+    if _ORIG_EXTRA_RESERVED["bytes"] is not None:     # бронью управляли мы - обновить факт
+        try:
+            st = client.status()
+            total = ((st.get("machine") or {}).get("gpu") or {}).get("total_mib")
+            free = (st.get("vram") or {}).get("vram_free_mib")
+            if total and free is not None:
+                comfy_note = update_global_vram_reservation(
+                    max(0, int(total) - int(free)) << 20)
+        except PolyStrataError:
+            pass
+    tail = f"; ComfyUI: {comfy_note}" if comfy_note else ""
+    print(f"[PolyStrata] смена модели завершена: теперь '{new_id or want}'{tail}", flush=True)
+    return note + tail
+
+
 def _chat_generate(server: str = "127.0.0.1:8080", prompt: str = "",
                    system_prompt: str = "", reasoning: str = "default",
                    max_tokens: int = 1024, temperature: float = 0.8, top_p: float = 0.95,
                    top_k: int = -1, seed: int = 0, reserve_mib: int = 0, images=None,
                    videos=None, max_images: int = 16, max_video_frames: int = 8,
                    max_frame_side: int = DEFAULT_FRAME_SIDE, memory=None, sampling=None,
-                   media=None, video_fps: int = 0, clear_comfy_vram: bool = False) -> tuple:
+                   media=None, video_fps: int = 0, clear_comfy_vram: bool = False,
+                   model: str = MODEL_SWITCH_OFF) -> tuple:
     """Единое ядро генерации для V3-нода (execute) и V1-фолбэка (generate).
     Возвращает (text, thoughts). Кнопка Cancel (interrupt) ComfyUI прерывает на любом шаге:
     во время запроса сокет закрывается ПО-НАСТОЯЩЕМУ (FIN), и watch-поток PolyStrata
@@ -1026,8 +1169,10 @@ def _chat_generate(server: str = "127.0.0.1:8080", prompt: str = "",
     (имена виджетов нигде не хардкодятся - любые списки от list-паков заменены первыми
     элементами, медиа-списки разворачивает в пины _as_pins); тоггл clear_comfy_vram
     выгружает модели ComfyUI ОДИН РАЗ на запуск воркфлоу.
-    Имени модели и api_key у нод нет: модель - запущенная на сервере (поле 'model' не
-    отправляется), доступ - localhost. Субнода Media (опционально) переопределяет лимиты
+    model (v0.9.0): сентинел 'как на сервере' - не влиять (поле 'model' в запрос НЕ
+    пишется, поведение v0.8.0); другая модель - ПЕРЕКЛЮЧИТЬ сервер до генерации
+    (POST /api/models/load, см. _ensure_model: выгрузка текущей + загрузка новой по её
+    конфигу strata-<модель>.json). Субнода Media (опционально) переопределяет лимиты
     кадров max_images/max_video_frames, ужатие max_frame_side и метки video_fps целиком:
     не подключена - дефолты из сигнатуры. top_k - виджет чата; <=0 поле не отправляется
     (умолчание сервера)."""
@@ -1045,11 +1190,18 @@ def _chat_generate(server: str = "127.0.0.1:8080", prompt: str = "",
     store = memory if hasattr(memory, "remember") else None
     sd = dict(sampling) if isinstance(sampling, dict) else {}
 
+    client = PolyStrataClient(server)
+    # --- смена модели (v0.9.0): ДО резерва и чтения контекста - они относятся к НОВОЙ
+    switch_note = ""
+    want_model = str(model or "").strip()
+    if want_model and want_model != MODEL_SWITCH_OFF:
+        _throw_if_interrupted()                  # последний шанс остановиться ДО переключения
+        switch_note = _ensure_model(client, want_model)
+
     # --- reserve VRAM для ComfyUI (ДО генерации; 0 = не трогаем сервер вовсе)
     reserve_note = ""
     if reserve_mib and int(reserve_mib) > 0:
-        client0 = PolyStrataClient(server)
-        reserve_note = _apply_reserve(client0, int(reserve_mib), 0,
+        reserve_note = _apply_reserve(client, int(reserve_mib), 0,
                                       stop_check=_throw_if_interrupted)
         _throw_if_interrupted()                  # выгрузка сегментов кэша может быть долгой
 
@@ -1060,7 +1212,6 @@ def _chat_generate(server: str = "127.0.0.1:8080", prompt: str = "",
     hist = store.history() if store is not None else []
 
     # --- контекст движка (best-effort) -> префлайт: кадры подгоняются под окно заранее
-    client = PolyStrataClient(server)
     n_ctx = _server_ctx(client)
     text_chars = len(sys_line) + len(prompt or "") + \
         sum(len(str(m.get("content") or "")) for m in hist)
@@ -1088,6 +1239,8 @@ def _chat_generate(server: str = "127.0.0.1:8080", prompt: str = "",
     kw.update({k: v for k, v in sd.items() if v is not None})
 
     notes = []
+    if switch_note:
+        notes.append(switch_note)
     if store is not None:
         notes.append(f"память: {store.turns()} ход(ов)")
     if sampling:
@@ -1212,9 +1365,14 @@ if _HAS_V3:
         clear_comfy_vram - тоггл: перед генерацией выгрузить модели САМОГО ComfyUI
         (checkpoint/LoRA и пр.) и почистить torch-кэш; в одном запуске воркфлоу - ОДИН РАЗ
         (лист на входе / цикл / несколько нод Chat повторно память не дёргают).
-        Лимиты кадров - в опциональной субноде Media (вход 'media'): max_images/
-        max_video_frames - НА КАЖДЫЙ пин своего типа; кадры заранее подгоняются под
-        контекст движка (узнаётся из /v1/status), потому что двигок запросы не обрезает.
+        Субнода Media (вход 'media') задаёт лимиты кадров НА КАЖДЫЙ пин своего типа;
+        перед отправкой кадры подгоняются под контекст движка (узнаётся из /v1/status),
+        потому что двигок запросы не обрезает.
+        Виджет model (v0.9.0): 'как на сервере' - не влиять; выбранная модель, если не
+        текущая, ПЕРЕКЛЮЧАЕТ сервер до генерации (POST /api/models/load: старый движок
+        останавливается, новая грузится по её конфигу strata-<модель>.json; первый старт
+        - минуты; идущая генерация дорабатывает). Дропдаун установленных моделей -
+        GET /api/models; обновляется F5 (перезагрузка страницы) или клавишей R в ComfyUI.
         Кнопка Cancel (interrupt) ComfyUI прерывает генерацию: соединение закрывается,
         сервер отменяет запрос.
         """
@@ -1236,6 +1394,8 @@ if _HAS_V3:
                              "видео кадрами (как Jan). Память и тонкий сэмплинг - суб-нодами."),
                 inputs=[
                     comfy_io.String.Input("server", default="127.0.0.1:8080", tooltip=SERVER_TOOLTIP),
+                    comfy_io.Combo.Input("model", options=_model_combo_options(),
+                                         default=MODEL_SWITCH_OFF, tooltip=MODEL_TOOLTIP),
                     comfy_io.String.Input("prompt", multiline=True,
                                           default="Опиши это видео или изображения подробно.",
                                           tooltip="Запрос к модели (роль user)."),
@@ -1313,13 +1473,16 @@ else:
 
     class PolyStrataChat:                    # V1-фолбэк: старый ComfyUI без comfy_api
         """V1-версия ноды Chat (ComfyUI без schema V3): вместо autogrow-пинов - два
-        фиксированных входа images/videos (IMAGE, можно батч). Поведение то же."""
+        фиксированных входа images/videos (IMAGE, можно батч). Поведение то же,
+        включая виджет model (переключение модели сервера до генерации)."""
 
         @classmethod
         def INPUT_TYPES(cls):
             return {
                 "required": {
                     "server": ("STRING", {"default": "127.0.0.1:8080", "tooltip": SERVER_TOOLTIP}),
+                    "model": (_model_combo_options(),
+                              {"default": MODEL_SWITCH_OFF, "tooltip": MODEL_TOOLTIP}),
                     "prompt": ("STRING", {"multiline": True,
                                           "default": "Опиши это видео или изображения подробно.",
                                           "tooltip": "Запрос к модели (роль user)."}),

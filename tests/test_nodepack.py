@@ -1,9 +1,12 @@
-"""test_nodepack.py - проверка нодпака ComfyUI-PolyStrata (v4) против мок-сервера PolyStrata.
+"""test_nodepack.py - проверка нодпака ComfyUI-PolyStrata (v5) против мок-сервера PolyStrata.
 
 Мок эмулирует реальные эндпоинты (форматы из serve/server.py PolyStrata и docs/VRAM_ELASTIC.md):
-  POST /v1/chat/completions, POST /v1/vram, POST /v1/unload, GET /v1/status
+  POST /v1/chat/completions, POST /v1/vram, POST /v1/unload, GET /v1/status,
+  GET /api/models, POST /api/models/load, POST /v1/load
   + пути ошибок: 400 --vram-elastic, 409 model_busy, 503+Retry-After, частичное освобождение
-  (частичный успех = 200, сверять vram_free_mib >= reserve_mib), "not loaded" для /v1/vram.
+  (частичный успех = 200, сверять vram_free_mib >= reserve_mib), "not loaded" для /v1/vram,
+  404 no model named / model not found, старый сервер без /api/models (фолбэк /v1/load
+  работает только при switch_on_request).
 
 Архитектура v6: Chat - SCHEMA V3 (comfy_api.latest) с autogrow-входами img_* (картинки) и
 vid_* (видео, каждый пин = отдельное видео кадрами), выходы text+thoughts; reasoning/
@@ -20,10 +23,13 @@ throw_exception_if_processing_interrupted поллится во время за�
 InterruptProcessingException наследует BaseException.
 Sampling - без temperature/top_p/top_k/reasoning/seed (они в чате), + logit_bias/
 extra_sampling; Media - опц. субнода лимитов кадров; Memory; Unload (полная выгрузка +
-сброс серверного резерва + возврат EXTRA_RESERVED_VRAM ComfyUI, сквозная). У нод НЕТ
-виджетов model/api_key/extra_mib (v0.8.0): модель - запущенная на сервере (поле 'model'
-не отправляется), доступ localhost, резерв - один reserve_mib. Бронь VRAM для ComfyUI -
-метод llama.cpp-нод: фактическое потребление
+сброс серверного резерва + возврат EXTRA_RESERVED_VRAM ComfyUI, сквозная). СМЕНА МОДЕЛИ
+(v0.9.0): виджет model в Chat (V3+V1) - дропдаун установленных моделей сервера
+(GET /api/models; сентинел 'как на сервере' первым, unavailable скрыты, кеш 15 c -
+обновляется F5/R через /object_info); выбранная модель, если не текущая, ПЕРЕКЛЮЧАЕТ
+сервер ДО генерации (POST /api/models/load; текущая/сентинел - поле 'model' в chat-запрос
+НЕ пишется). Виджетов api_key/extra_mib нет: доступ localhost, резерв - один reserve_mib.
+Бронь VRAM для ComfyUI - метод llama.cpp-нод: фактическое потребление
 PolyStrata (status.machine.gpu.total_mib - vram_free_mib) -> EXTRA_RESERVED_VRAM.
 АВТО-ВЫГРУЗКА (механика llama.cpp-нод): Chat помечает сервер как используемый; хук на
 PromptExecutor.execute выгружает сервер-сироту (главная нода забайпашена - новый фронт шлёт
@@ -193,6 +199,36 @@ class MockState:
         self.chat_delay = 0.0          # сек «генерации» перед ответом (тест interrupt)
         self.disconnect_seen = False   # сервер заметил обрыв клиента (EOF) во время генерации
         self.disconnect_dt = None      # через сколько секунд после начала «генерации»
+        # ---- реестр моделей (GET /api/models, POST /api/models/load) - serve/models.py
+        self.models = [
+            {"id": "gemma-4-26b-a4b", "config": "strata-gemma-4-26b-a4b.json",
+             "display_name": "Gemma 4 26B", "backend": "gemma4", "quantization": "Q4_K_M",
+             "params_total": "26B", "params_active": "4B", "context": 32768,
+             "multimodal": True, "aliases": ["gemma4"], "mtp": False, "ram_gb": 15.0,
+             "vram_gb": {"least": 6.0, "all": 16.0}, "status": "loaded", "problem": None},
+            {"id": "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m",
+             "config": "strata-sage-a1.5.json", "display_name": "Sage A1.5",
+             "backend": "qwen4exp", "quantization": "i1-q4_k_m", "params_total": None,
+             "params_active": None, "context": 128000, "multimodal": False, "aliases": [],
+             "mtp": True, "ram_gb": 9.0, "vram_gb": {"least": 3.0, "all": 10.0},
+             "status": "available", "problem": None},
+            {"id": "qwen3.8-flash-next-iq3_s", "config": "strata-qwen3.8.json",
+             "display_name": "Qwen3.8 Flash Next", "backend": "qwen4exp",
+             "quantization": "iq3_s", "params_total": None, "params_active": None,
+             "context": 131072, "multimodal": True, "aliases": ["qwen-flash"], "mtp": False,
+             "ram_gb": 5.0, "vram_gb": {"least": 2.0, "all": 6.0},
+             "status": "available", "problem": None},
+            {"id": "broken-model", "config": "strata-broken.json",
+             "display_name": "Broken", "backend": "unknown", "quantization": None,
+             "params_total": None, "params_active": None, "context": None,
+             "multimodal": False, "aliases": [], "mtp": False, "ram_gb": None,
+             "vram_gb": None, "status": "unavailable",
+             "problem": "the model file is missing"},
+        ]
+        self.current = "gemma-4-26b-a4b"   # загруженная модель (id)
+        self.load_calls = []                 # [{"path": ..., "model": ...}] - переключения
+        self.old_server = False              # True -> 404 на /api/models и /api/models/load
+        self.load_fallback_ok = False        # /v1/load принимает ЧУЖОЕ имя (switch_on_request)
 
 
 ST = MockState()
@@ -221,7 +257,7 @@ class MockHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/status":
             ST.last_status = True
             self._json(200, {
-                "service": "strata", "model": "gemma-4-26b-a4b", "loaded": not ST.sleeping,
+                "service": "strata", "model": ST.current, "loaded": not ST.sleeping,
                 "engine": "strata-poly 0.1.45-poly.6", "uptime_s": 1234, "started": ST.started,
                 "cache_max_tokens": ST.ctx_n,
                 "context": {"native": ST.ctx_n, "max_positions": ST.ctx_n},
@@ -233,6 +269,19 @@ class MockHandler(BaseHTTPRequestHandler):
                 "machine": {"gpu": {"name": "RTX 5090", "used_mib": TOTAL_GPU_MIB - ST.free_mib,
                                     "total_mib": TOTAL_GPU_MIB, "util_pct": 3, "temp_c": 41}},
             })
+            return
+        if self.path == "/api/models":
+            if ST.old_server:                 # сервер до появления реестра в API
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            models = []
+            for e in ST.models:
+                e2 = dict(e)
+                e2["current"] = e2["id"] == ST.current
+                if e2["current"]:
+                    e2["status"] = "loaded" if not ST.sleeping else "unloaded"
+                models.append(e2)
+            self._json(200, {"models": models, "current": ST.current})
             return
         if self.path == "/props":
             self._json(200, {"default_generation_settings": {"n_ctx": ST.props_ctx or ST.ctx_n},
@@ -307,6 +356,35 @@ class MockHandler(BaseHTTPRequestHandler):
                              "expert_slots_full": 3700, "expert_cache_mib": ST.cache_mib,
                              "expert_cache_full_mib": 6000, "vram_free_mib": ST.free_mib,
                              "prompt_chunk": 4096})
+            return
+        if path == "/api/models/load":
+            req = self._body()
+            ST.load_calls.append({"path": "/api/models/load", "model": req.get("model")})
+            if ST.old_server:
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            name = req.get("model")
+            entry = next((e for e in ST.models if e["id"] == name), None)
+            if entry is None:
+                self._json(404, {"error": {"message": f"no model named {name!r}",
+                                           "models": [e["id"] for e in ST.models]}})
+                return
+            ST.current, ST.sleeping = entry["id"], False
+            self._json(200, {"status": "loaded",
+                             "model": {**entry, "status": "loaded", "current": True}})
+            return
+        if path == "/v1/load":
+            req = self._body()
+            ST.load_calls.append({"path": "/v1/load", "model": req.get("model")})
+            m = req.get("model")
+            if m not in (None, ST.current):
+                if not ST.load_fallback_ok:   # switch_on_request выключен (#38)
+                    self._json(404, {"error": {"message": "model not found"}})
+                    return
+                entry = next((e for e in ST.models if e["id"] == m), None)
+                if entry is not None:
+                    ST.current, ST.sleeping = entry["id"], False
+            self._json(200, {"status": "loaded", "model": ST.current})
             return
         if path == "/v1/unload":
             wait = query.get("wait", [None])[0]
@@ -414,7 +492,7 @@ def main():
     check("NODE_CLASS_MAPPINGS (старый загрузчик)", set(pack2.NODE_CLASS_MAPPINGS) == expected)
     check("нод Load/VRAM больше нет",
           not any(k for k in pack.NODE_CLASS_MAPPINGS if "Load" in k or "Vram" in k))
-    check("версия 0.8.0", getattr(pack, "__version__", "") == "0.8.0")
+    check("версия 0.9.0", getattr(pack, "__version__", "") == "0.9.0")
 
     samp_node = nodes_mod.PolyStrataSampling()
     mem_node = nodes_mod.PolyStrataMemory()
@@ -422,6 +500,8 @@ def main():
 
     # ---------- 2. Schema V3 ноды Chat ----------
     print("\n[2] Schema V3: autogrow-входы картинок и видео отдельно")
+    nodes_mod.mark_server_active(server)   # дропдаун model строится по серверам сессии
+    nodes_mod._MODEL_LIST_CACHE.clear()
     schema = nodes_mod.PolyStrataChat.define_schema()
     ins = {i.name: i for i in schema["inputs"]}
     outs = schema["outputs"]
@@ -453,9 +533,20 @@ def main():
     check("виджеты server/prompt/system_prompt_preset/system_prompt_text",
           all(n in ins for n in ("server", "prompt", "system_prompt_preset",
                                  "system_prompt_text")))
-    check("мусор v0.7 вычищен: НЕТ model/api_key/extra_mib и медиа-лимитов в чате",
-          not ({"model", "api_key", "extra_mib", "max_frame_side", "max_images",
-                "max_video_frames", "video_fps"} & set(ins)))
+    check("мусор v0.7 вычищен: НЕТ api_key/extra_mib и медиа-лимитов в чате (model - ЕСТЬ, v0.9.0)",
+          not ({"api_key", "extra_mib", "max_frame_side", "max_images",
+                "max_video_frames", "video_fps"} & set(ins)) and "model" in ins)
+    check("виджет model СРАЗУ после server (v0.9.0)",
+          "model" in ins and list(ins).index("server") < list(ins).index("model")
+          and ins["model"].kind == "COMBO")
+    check("model: сентинел 'как на сервере' первым и он же default",
+          ins["model"].kw["options"][0] == nodes_mod.MODEL_SWITCH_OFF
+          and ins["model"].kw["default"] == nodes_mod.MODEL_SWITCH_OFF)
+    check("model: дропдаун - модели сервера, unavailable скрыт",
+          {"gemma-4-26b-a4b", "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m",
+           "qwen3.8-flash-next-iq3_s"} <= set(ins["model"].kw["options"])
+          and "broken-model" not in ins["model"].kw["options"],
+          str(ins["model"].kw["options"]))
     check("пресет: список опций начинается с 'none' и содержит .txt из models/LLM/prompts",
           ins["system_prompt_preset"].kw["options"][0] == nodes_mod.NO_SYSTEM_PROMPT
           and isinstance(ins["system_prompt_preset"].kw["options"], list))
@@ -553,6 +644,74 @@ def main():
     check("seed=0 (случайный) не отправляется", "seed" not in ST.last_chat)
     out, _ = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="x", top_k=33)
     check("top_k из виджета чата уходит в запрос", ST.last_chat.get("top_k") == 33)
+
+    # ---------- 4b. Смена модели (v0.9.0): виджет model в главной ноде ----------
+    print("\n[4b] Смена модели: дропдаун, сентинел, переключение, ошибки")
+    nodes_mod._MODEL_LIST_CACHE.clear()
+    opts = nodes_mod._model_combo_options()
+    check("_model_combo_options: сентинел первым + модели сессии (unavailable скрыт)",
+          opts[0] == nodes_mod.MODEL_SWITCH_OFF
+          and {"gemma-4-26b-a4b", "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m",
+               "qwen3.8-flash-next-iq3_s"} <= set(opts)
+          and "broken-model" not in opts, str(opts))
+    ids = nodes_mod._server_model_ids(server)
+    check("_server_model_ids: только id, unavailable скрыт",
+          ids == ["gemma-4-26b-a4b", "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m",
+                  "qwen3.8-flash-next-iq3_s"], str(ids))
+    ST.load_calls.clear()
+    out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="сентинел",
+                       model=nodes_mod.MODEL_SWITCH_OFF)
+    check("сентинел 'как на сервере': сервер НЕ трогается (нет load-вызовов)",
+          not ST.load_calls and ST.current == "gemma-4-26b-a4b")
+    check("сентинел: поле 'model' в chat-запрос НЕ пишется", "model" not in ST.last_chat)
+    out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="текущая",
+                       model="gemma-4-26b-a4b")
+    check("текущая модель: load НЕ вызывается (лишний раз сервер не дёргаем)",
+          not ST.load_calls and "model" not in ST.last_chat)
+    out, log = capture(nodes_mod.PolyStrataChat.execute, server=server,
+                       prompt="переключись", model="qwen3.8-flash-next-iq3_s")
+    check("чужая модель: POST /api/models/load {model: id}",
+          ST.load_calls and ST.load_calls[-1] == {"path": "/api/models/load",
+                                                  "model": "qwen3.8-flash-next-iq3_s"},
+          str(ST.load_calls))
+    check("сервер переключился (current в моке сменился)", ST.current == "qwen3.8-flash-next-iq3_s")
+    check("chat-запрос идёт НОВОЙ модели БЕЗ поля 'model'", "model" not in ST.last_chat)
+    check("в логе - 'смена модели'", "смена модели" in log, log[-400:])
+    ST.current = "gemma-4-26b-a4b"                  # вернуть для остальных тестов
+    try:
+        capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="?",
+                model="no-such-model")
+        check("404 no model named -> понятная ошибка", False)
+    except nodes_mod.PolyStrataError as e:
+        check("404 no model named -> понятная ошибка (сервер не знает такую модель)",
+              "не знает такую модель" in str(e), str(e)[:200])
+    # старый сервер: реестра нет - дропдаун из /v1/status, переключение через /v1/load
+    nodes_mod._MODEL_LIST_CACHE.clear()
+    ST.old_server = True
+    ids = nodes_mod._server_model_ids(server)
+    check("старый сервер (404 /api/models): список = текущая модель из /v1/status",
+          ids == ["gemma-4-26b-a4b"], str(ids))
+    try:
+        capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="?",
+                model="qwen3.8-flash-next-iq3_s")
+        check("старый сервер без switch_on_request: /v1/load -> 404 model not found", False)
+    except nodes_mod.PolyStrataError as e:
+        check("старый сервер без switch_on_request: /v1/load -> 404 model not found",
+              "model not found" in str(e), str(e)[:200])
+        check("фолбэк дошёл до /v1/load",
+              ST.load_calls and ST.load_calls[-1]["path"] == "/v1/load", str(ST.load_calls))
+    ST.load_fallback_ok = True                       # switch_on_request включён
+    ST.current = "gemma-4-26b-a4b"
+    out, log = capture(nodes_mod.PolyStrataChat.execute, server=server, prompt="фолбэк",
+                       model="qwen3.8-flash-next-iq3_s")
+    check("старый сервер + switch_on_request: /v1/load переключил и генерация прошла",
+          ST.load_calls[-1] == {"path": "/v1/load", "model": "qwen3.8-flash-next-iq3_s"}
+          and ST.current == "qwen3.8-flash-next-iq3_s"
+          and out[1][0] == "МОК-ОТВЕТ: всё вижу.", str(ST.load_calls[-2:]))
+    ST.old_server = False
+    ST.load_fallback_ok = False
+    ST.current = "gemma-4-26b-a4b"
+    nodes_mod._MODEL_LIST_CACHE.clear()
 
     # ---------- 5. Chat V3: картинки и видео РАЗДЕЛЬНО ----------
     print("\n[5] Chat V3 - autogrow: img_* и vid_* отдельно")
@@ -1046,10 +1205,15 @@ def main():
         cin = nv1.PolyStrataChat.INPUT_TYPES()
         check("V1: входы images/videos (IMAGE) отдельно",
               cin["optional"]["images"][0] == "IMAGE" and cin["optional"]["videos"][0] == "IMAGE")
-        check("V1: seed и top_k в чате, model/api_key/extra_mib/медиа-лимитов НЕТ",
+        check("V1: seed/top_k/model в чате, api_key/extra_mib/медиа-лимитов НЕТ",
               "seed" in cin["required"] and "top_k" in cin["required"]
-              and not ({"model", "api_key", "extra_mib", "max_frame_side", "max_images",
+              and "model" in cin["required"]
+              and not ({"api_key", "extra_mib", "max_frame_side", "max_images",
                         "max_video_frames", "video_fps"} & set(cin["required"])))
+        check("V1: model - сентинел первым в опциях (default), виджет после server",
+              cin["required"]["model"][0][0] == nv1.MODEL_SWITCH_OFF
+              and cin["required"]["model"][1].get("default") == nv1.MODEL_SWITCH_OFF
+              and list(cin["required"]).index("server") < list(cin["required"]).index("model"))
         check("V1: media - опциональный вход PS_MEDIA",
               cin["optional"]["media"][0] == nodes_mod.PS_MEDIA)
         check("V1: пресеты тоже есть (system_prompt_preset/system_prompt_text)",
@@ -1061,6 +1225,15 @@ def main():
               and cin["required"]["clear_comfy_vram"][1].get("default") is False)
         check("V1: выходы text+thoughts", nv1.PolyStrataChat.RETURN_TYPES == ("STRING", "STRING"))
         v1 = nv1.PolyStrataChat()
+        ST.load_calls.clear()
+        out, _ = capture(v1.generate, server=server, prompt="V1-смена",
+                         model="sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m")
+        check("V1: переключение тоже работает (POST /api/models/load)",
+              ST.load_calls and ST.load_calls[-1] == {"path": "/api/models/load",
+                                                      "model": "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m"}
+              and ST.current == "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m"
+              and "model" not in ST.last_chat, str(ST.load_calls))
+        ST.current = "gemma-4-26b-a4b"
         out, _ = capture(v1.generate, server=server, prompt="V1-тест", seed=77,
                          videos=make_fake_image_batch(2), media=make_media(max_video_frames=2))
         check("V1 generate работает", out == ("МОК-ОТВЕТ: всё вижу.", ST.thoughts), str(out))
@@ -1115,6 +1288,16 @@ def main():
     check("пустой адрес -> ошибка",
           bool(_try(lambda: ps("  ").base)))
     cli = ps(server, "")
+    out, _ = capture(cli.models)
+    check("клиент: GET /api/models -> current + записи реестра",
+          out.get("current") == ST.current and isinstance(out.get("models"), list)
+          and len(out["models"]) == 4 and "id" in out["models"][0], str(out)[:160])
+    out, _ = capture(cli.switch_model, "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m")
+    check("клиент: switch_model -> {'status': 'loaded', 'model': {запись}}",
+          out.get("status") == "loaded"
+          and out.get("model", {}).get("id") == "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m"
+          and ST.current == "sage-a1.5-ablitrex-abliterated-bf16.i1-q4_k_m", str(out)[:160])
+    ST.current = "gemma-4-26b-a4b"
     out, _ = capture(cli.chat, [{"role": "user", "content": "п"}], stop=["а", "б", "в", "г", "д"])
     check("stop > 4 строк -> 4", len(ST.last_chat.get("stop", [])) == 4)
     out, _ = capture(cli.chat, [{"role": "user", "content": "п"}], top_k=0, seed=0)

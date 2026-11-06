@@ -30,6 +30,34 @@
                               context.native (окно движка в токенах)
   GET  /props                 свойства сервера (default_generation_settings.n_ctx и пр.)
 
+Смена модели на работающем сервере (serve/server.py: Service.switch_model + serve/models.py,
+                              реестр strata-*.json в корне установки PolyStrata):
+  GET  /api/models            установленные модели + текущая: {"models": [записи], "current": id}.
+                              Запись: id, config (путь strata-<модель>.json), display_name,
+                              backend, quantization, params_total/active, context, multimodal,
+                              aliases, mtp, ram_gb, vram_gb{least,all}, status
+                              (available/loaded/unloaded/loading/unavailable), problem, current.
+  POST /api/models/load       {"model": "<id>"} - ПЕРЕКЛЮЧИТЬ сервер на эту модель: текущий
+                              движок останавливается (VRAM/RAM освобождаются), новая модель
+                              грузится по СВОЕМУ конфигу strata-<модель>.json. Сервер ждёт
+                              окончания идущих запросов (до 120 c), затем отвечает
+                              {"status": "loaded", "model": <запись>}. Ошибки: 404 no model
+                              named (в теле - список ids), 409 занят, 422 конфиг неисправен,
+                              503 не стартовала (сервер вернул прежнюю). Совпадение имён -
+                              id/имя конфига/уникальное подстрочное вхождение (find()).
+                              Требует Content-Type: application/json и отсутствия чужого Origin
+                              (_own_page: снаружи браузером модель не переключишь) - requests
+                              это выполняет автоматически.
+  POST /v1/load               {"model": "<id>"?} - разбудить/загрузить; с чужим именем работает
+                              ТОЛЬКО при включённом на сервере switch_on_request (иначе 404
+                              model not found); без поля - просто убедиться, что загружена.
+                              Наш клиент дергает его как ЗАПАСНОЙ путь на старом сервере без
+                              /api/models/load.
+
+Динамический список моделей для дропдаунов нод читается ЭТИМИ же эндпоинтами при каждом
+построении ноды (define_schema/INPUT_TYPES): ComfyUI перечитывает /object_info при обновлении
+страницы браузера (F5) и по горячей клавише R - дропдаун показывает актуальный список.
+
 Прерывание (кнопка Cancel / interrupt в ComfyUI): методы chat/vram/unload принимают
 stop_check - колбэк comfy.model_management.throw_exception_if_processing_interrupted.
 Interruptible-запросы идут через http.client (НЕ requests): сокет наш (conn.sock),
@@ -103,8 +131,10 @@ class PolyStrataClient:
     def __init__(self, server: str, api_key: str = ""):
         self.base = _server_base(server)
         self.api_key = (api_key or "").strip()
-        # (connect, read); генерация больших моделей бывает долгой - read щедрый
-        self.timeouts = {"chat": (10, 1800), "control": (10, 360), "quick": (10, 30)}
+        # (connect, read); генерация больших моделей бывает долгой - read щедрый;
+        # "switch" - смена модели: выгрузка старой + загрузка новой идут минутами
+        self.timeouts = {"chat": (10, 1800), "control": (10, 360), "quick": (10, 30),
+                         "switch": (10, 1800)}
 
     # ------------------------------------------------------------------ низкий уровень
     def _headers(self) -> dict:
@@ -170,6 +200,7 @@ class PolyStrataClient:
 
     def _raise_http(self, status: int, text: str, path: str):
         msg = _error_message(status, text)
+        err = None
         if status == 400 and "--vram-elastic" in msg:
             raise PolyStrataError(
                 "Сервер передал движку флаг --vram-elastic: в конфиге модели (strata-<модель>.json) "
@@ -186,21 +217,39 @@ class PolyStrataClient:
                 "типа. Уменьшите их или max_frame_side (длинную сторону кадра), ходы памяти "
                 "(max_turns ноды Memory) или длину промпта. Сервер ответил: " + msg)
         if status == 409:
-            raise PolyStrataError(
+            err = PolyStrataError(
                 f"Сервер занят (409 model_busy): идёт генерация или запрос в очереди - {msg}. "
-                f"Для /v1/unload включите 'wait', для /v1/vram повторите после завершения генерации.")
-        if status == 503:
-            raise PolyStrataError(
+                f"Для /v1/unload включите 'wait', для смены модели (api/models/load) дождитесь "
+                f"окончания генерации и повторите; для /v1/vram повторите позже.")
+        if status == 404 and "no model named" in msg:
+            err = PolyStrataError(
+                f"Сервер не знает такую модель: {msg}. Список установленных моделей - "
+                f"GET /api/models (дропдаун ноды обновляется перезагрузкой страницы "
+                f"браузера или клавишей R в ComfyUI; свежие strata-*.json подхватываются "
+                f"сервером сами).")
+        if status == 422:
+            err = PolyStrataError(
+                f"Модель не может быть загружена - её конфиг неисправен (422): {msg}. "
+                f"Проверьте strata-<модель>.json на сервере (пути exe/args/tokenizer).")
+        if status == 503 and path.startswith("/api/models/load"):
+            err = PolyStrataError(
+                f"Переключение НЕ удалось (503): {msg}. Сервер при этом возвращает прежнюю "
+                f"модель (или никакой, если и она не стартовала) - проверьте лог сервера.")
+        if err is None and status == 503:
+            err = PolyStrataError(
                 f"Сервер отвечает 503: {msg}. Частая причина - не выполнен min_free_vram_mib (свободной VRAM "
                 f"меньше минимума, модель не стартует; освободите VRAM и повторите).")
-        if status == 404 and "model not found" in msg:
-            raise PolyStrataError(
+        if err is None and status == 404 and "model not found" in msg:
+            err = PolyStrataError(
                 f"404: {msg}. Ноды имя модели не передают - сервер сам берёт запущенную "
                 f"(run-<модель>.bat); проверьте, что модель запущена и конфиг верен "
                 f"(GET /v1/status). Поле 'model' в запрос мог попасть через extra_sampling.")
-        if status in (401, 403):
-            raise PolyStrataError(f"{status}: требуется API-ключ сервера - {msg}")
-        raise PolyStrataError(f"HTTP {status} от {path}: {msg}")
+        if err is None and status in (401, 403):
+            err = PolyStrataError(f"{status}: требуется API-ключ сервера - {msg}")
+        if err is None:
+            err = PolyStrataError(f"HTTP {status} от {path}: {msg}")
+        err.status = status                 # код ответа на исключении (для ветвления выше)
+        raise err
 
     # -------------------------------------------------------- прерывание (Cancel ComfyUI)
     @staticmethod
@@ -374,3 +423,52 @@ class PolyStrataClient:
     def props(self) -> dict:
         """GET /props - свойства сервера (default_generation_settings.n_ctx, chat_template ...)."""
         return self._request("GET", "/props", timeout=self.timeouts["quick"])
+
+    # ------------------------------------------------------------------ смена модели
+    def models(self, timeout=None) -> dict:
+        """GET /api/models - УСТАНОВЛЕННЫЕ модели сервера (реестр strata-*.json в корне
+        установки PolyStrata) и текущая: {"models": [записи], "current": "<id>"}.
+        Запись (serve/models.py describe()): id, config, display_name, backend, path,
+        quantization, params_total/params_active, context, multimodal, aliases, mtp,
+        ram_gb, vram_gb{least,all}, status (available|loaded|unloaded|loading|unavailable),
+        problem, current. Сортировка по id; aliases отдельными записями НЕ разводятся.
+        timeout - короткий для построения дропдаунов (/object_info не должен виснуть):
+        (connect, read), по умолчанию self.timeouts['quick'].
+        Старый сервер без /api/models - PolyStrataError со status=404 (запасной путь -
+        GET /v1/status: только имя текущей модели)."""
+        return self._request("GET", "/api/models",
+                             timeout=timeout or self.timeouts["quick"])
+
+    def switch_model(self, name: str, stop_check=None) -> dict:
+        """POST /api/models/load {"model": name} - ПЕРЕКЛЮЧИТЬ сервер на модель name:
+        текущий движок останавливается (вся VRAM/RAM модели освобождается), новая грузится
+        по СВОЕМУ конфигу strata-<модель>.json - первый старт идёт минуты (в консоли сервера
+        '[strata] switching the model: ...'). Сервер ждёт окончания идущих запросов до 120 c,
+        затем отвечает {"status": "loaded", "model": <запись новой текущей>}.
+        Имя - id модели, имя её конфига или уникальное подстрочное вхождение.
+        Ошибки: 404 no model named, 409 занят, 422 конфиг неисправен, 503 не стартовала
+        (сервер вернул прежнюю модель). На старом сервере без /api/models/load - запасной
+        POST /v1/load (работает только при включённом switch_on_request).
+        stop_check - Cancel ComfyUI: обрывает ОЖИДАНИЕ переключения (сервер при этом
+        завершит переключение сам - это его состояние, а не запрос)."""
+        payload = {"model": str(name or "").strip()}
+        try:
+            return self._request("POST", "/api/models/load", payload,
+                                 timeout=self.timeouts["switch"], stop_check=stop_check)
+        except PolyStrataError as e:
+            # 404 «no model named» - имя правда неизвестно; голый 404 «not found» -
+            # старый сервер без эндпоинта: пробуем /v1/load (switch_on_request)
+            if getattr(e, "status", None) != 404 or "no model named" in str(e):
+                raise
+            return self.load(payload["model"], stop_check=stop_check)
+
+    def load(self, model: str = "", stop_check=None) -> dict:
+        """POST /v1/load - разбудить/загрузить модель (тёплый старт по требованию).
+        С полем "model": имя ЧУЖОЙ установленной модели грузит её - но ТОЛЬКО при
+        включённом на сервере switch_on_request (#38), иначе 404 model not found;
+        без поля - убедиться, что ТЕКУЩАЯ загружена. Ответ: {"status": "loaded", .../v1/status}.
+        Нодам обычно не нужен: чат-запрос будит модель сам; используется как запасной
+        путь switch_model на старых серверах."""
+        payload = {"model": str(model or "").strip()} if str(model or "").strip() else {}
+        return self._request("POST", "/v1/load", payload, timeout=self.timeouts["switch"],
+                             stop_check=stop_check)
