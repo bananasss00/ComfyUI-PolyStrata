@@ -236,10 +236,69 @@ class MockState:
         self.load_calls = []                 # [{"path": ..., "model": ...}] - переключения
         self.old_server = False              # True -> 404 на /api/models и /api/models/load
         self.load_fallback_ok = False        # /v1/load принимает ЧУЖОЕ имя (switch_on_request)
+        # реестр с ДИСКА (секция [13], нода Control Vector): папка со strata-*.json;
+        # None - статический список выше. Мини-аналог serve/models.py discover():
+        # невалидные конфиги пропускаются молча, id = model_name или стем без "strata-".
+        self.registry_dir = None
+        # engine.cvec в /metrics: None - выводить из КОНФИГА текущей модели (как
+        # движок, стартовавший по этому конфигу); иначе - явное значение (0/строка).
+        self.cvec_info = None
 
 
 ST = MockState()
 TOTAL_GPU_MIB = 32608            # machine.gpu.total_mib в /v1/status
+
+
+def _models_list() -> list:
+    """Записи реестра: статические ИЛИ из ST.registry_dir (мини-discover).
+    Формат - как serve/models.py describe(): id, config (АБСОЛЮТНЫЙ путь),
+    display_name, path (значение --model), status, problem, current не тут - его
+    выставляет обработчик. Невалидные (нет exe/args не список) пропускаются молча."""
+    if not ST.registry_dir:
+        return list(ST.models)
+    out = []
+    import pathlib as _pl
+    for p in sorted(_pl.Path(ST.registry_dir).glob("strata-*.json")):
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(cfg, dict) or not cfg.get("exe") or not isinstance(cfg.get("args"), list):
+            continue
+        args = [str(a) for a in cfg["args"]]
+        model = args[args.index("--model") + 1] if "--model" in args[:-1] else None
+        mid = str(cfg.get("model_name") or p.stem.replace("strata-", "", 1))
+        out.append({"id": mid, "config": str(p),
+                    "display_name": cfg.get("display_name") or mid,
+                    "backend": "qwen4exp", "path": model, "quantization": None,
+                    "params_total": None, "params_active": None, "context": None,
+                    "multimodal": False, "aliases": [], "mtp": False, "ram_gb": None,
+                    "vram_gb": None, "status": "available", "problem": None})
+    return out
+
+
+def _live_cvec():
+    """engine.cvec для /metrics: явное ST.cvec_info или вывод из КОНФИГА текущей
+    модели (движок, стартовавший по нему, отчитывается так в serve/server.py)."""
+    if ST.cvec_info is not None:
+        return ST.cvec_info
+    for e in _models_list():
+        if e["id"] != ST.current:
+            continue
+        try:
+            cfg = json.loads(open(e["config"], encoding="utf-8-sig").read())
+        except (OSError, ValueError):
+            return 0
+        a = [str(x) for x in (cfg.get("args") or [])]
+        if "--control-vector-scaled" not in a:
+            return 0
+        rng = "0-0"
+        if "--control-vector-layer-range" in a[:-1]:
+            i = a.index("--control-vector-layer-range")
+            rng = f"{a[i + 1]}-{a[i + 2]}"
+        mode = a[a.index("--cvec-mode") + 1] if "--cvec-mode" in a[:-1] else "add"
+        return f"{mode}:{rng}"
+    return 0
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -282,13 +341,21 @@ class MockHandler(BaseHTTPRequestHandler):
                 self._json(404, {"error": {"message": "not found"}})
                 return
             models = []
-            for e in ST.models:
+            for e in _models_list():
                 e2 = dict(e)
                 e2["current"] = e2["id"] == ST.current
                 if e2["current"]:
                     e2["status"] = "loaded" if not ST.sleeping else "unloaded"
                 models.append(e2)
             self._json(200, {"models": models, "current": ST.current})
+            return
+        if self.path == "/metrics":
+            if ST.old_server:                 # старый сервер без /metrics
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            self._json(200, {"engine": {"model": ST.current, "max_context": ST.ctx_n,
+                                     "images": False, "cvec": _live_cvec()},
+                             "live": {"state": "idle"}, "totals": {}})
             return
         if self.path == "/props":
             self._json(200, {"default_generation_settings": {"n_ctx": ST.props_ctx or ST.ctx_n},
@@ -371,10 +438,10 @@ class MockHandler(BaseHTTPRequestHandler):
                 self._json(404, {"error": {"message": "not found"}})
                 return
             name = req.get("model")
-            entry = next((e for e in ST.models if e["id"] == name), None)
+            entry = next((e for e in _models_list() if e["id"] == name), None)
             if entry is None:
                 self._json(404, {"error": {"message": f"no model named {name!r}",
-                                           "models": [e["id"] for e in ST.models]}})
+                                           "models": [e["id"] for e in _models_list()]}})
                 return
             ST.current, ST.sleeping = entry["id"], False
             self._json(200, {"status": "loaded",
@@ -437,6 +504,47 @@ def make_fake_image_batch(n=2, h=48, w=72):
     return rng.random((n, h, w, 3), dtype=np.float32)
 
 
+def write_test_gguf(path, kv=None, tensor_names=None, data_bytes=64):
+    """Минимальный валидный GGUF для тестов cvec.py: kv-пары (str/int/bool/float)
+    + тен-инфо по именам (данные - нули; парсер узла читает только заголовок).
+    Порядок полей - как gguf-py: магия, версия, n_tensors, n_kv, kv, тензоры."""
+    import struct as _s
+    kv = kv or {}
+    tensor_names = tensor_names or []
+    buf = io.BytesIO()
+    buf.write(b"GGUF")
+    buf.write(_s.pack("<I", 3))                              # версия 3
+    buf.write(_s.pack("<Q", len(tensor_names)))
+    buf.write(_s.pack("<Q", len(kv)))
+    for k, v in kv.items():
+        kb = k.encode()
+        buf.write(_s.pack("<Q", len(kb)) + kb)
+        if isinstance(v, bool):
+            buf.write(_s.pack("<I", 7))                     # BOOL
+            buf.write(_s.pack("<B", int(v)))
+        elif isinstance(v, int):
+            buf.write(_s.pack("<I", 4))                     # UINT32
+            buf.write(_s.pack("<I", v))
+        elif isinstance(v, float):
+            buf.write(_s.pack("<I", 6))                     # FLOAT32
+            buf.write(_s.pack("<f", v))
+        else:
+            vb = str(v).encode()
+            buf.write(_s.pack("<I", 8))                     # STRING
+            buf.write(_s.pack("<Q", len(vb)) + vb)
+    for name in tensor_names:
+        nb = name.encode()
+        buf.write(_s.pack("<Q", len(nb)) + nb)
+        buf.write(_s.pack("<I", 1))                         # n_dims
+        buf.write(_s.pack("<Q", 8))                         # dim
+        buf.write(_s.pack("<I", 0))                         # type F32
+        buf.write(_s.pack("<Q", 0))                         # offset
+    buf.write(b"\x00" * data_bytes)
+    with open(path, "wb") as fh:
+        fh.write(buf.getvalue())
+    return path
+
+
 def make_media(max_frame_side=1024, max_images=16, max_video_frames=8, video_fps=0):
     """Субнода PolyStrataMedia с заданными лимитами (как после исполнения ноды).
     Модуль берётся из sys.modules: в V1-секции пак перезагружен без comfy_api -
@@ -488,7 +596,7 @@ def main():
     print("\n[1] Импорт пакета")
     pack = load_pack(as_package=True)
     expected = {"PolyStrataChat", "PolyStrataSampling", "PolyStrataMedia",
-                "PolyStrataMemory", "PolyStrataUnload"}
+                "PolyStrataMemory", "PolyStrataUnload", "PolyStrataControlVector"}
     check("NODE_CLASS_MAPPINGS (package-загрузка)", set(pack.NODE_CLASS_MAPPINGS) == expected,
           str(sorted(pack.NODE_CLASS_MAPPINGS)))
     import importlib as _il
@@ -499,7 +607,7 @@ def main():
     check("NODE_CLASS_MAPPINGS (старый загрузчик)", set(pack2.NODE_CLASS_MAPPINGS) == expected)
     check("нод Load/VRAM больше нет",
           not any(k for k in pack.NODE_CLASS_MAPPINGS if "Load" in k or "Vram" in k))
-    check("версия 0.9.1", getattr(pack, "__version__", "") == "0.9.1")
+    check("версия 0.10.0", getattr(pack, "__version__", "") == "0.10.0")
 
     samp_node = nodes_mod.PolyStrataSampling()
     mem_node = nodes_mod.PolyStrataMemory()
@@ -1284,7 +1392,8 @@ def main():
               len(media_parts(ST.last_chat)) == 3, str(len(media_parts(ST.last_chat))))
     finally:
         restore_comfy_api(saved)
-        for stale in ("ComfyUI-PolyStrata", "ComfyUI-PolyStrata.nodes", "ComfyUI-PolyStrata.ps_client"):
+        for stale in ("ComfyUI-PolyStrata", "ComfyUI-PolyStrata.nodes", "ComfyUI-PolyStrata.ps_client",
+                      "ComfyUI-PolyStrata.cvec"):
             sys.modules.pop(stale, None)
 
     # ---------- 11. клиент ----------
@@ -1388,6 +1497,229 @@ def main():
           _roundtrip(True))
     check("актуальный формат узнаётся (якорь на 5) - миграция не трогает",
           _anchor([by_widget[n] for n in widget_names]) == 5)
+
+    # ---------- 13. Control Vector: вариант-конфиг, скан, переключение ----------
+    print("\n[13] Control Vector: вариант-конфиг, скан векторов, переключение")
+    import tempfile as _tf
+    import shutil as _sh
+    cv = nodes_mod._cvec
+    reg = _tf.mkdtemp(prefix="ps_cvec_reg_")
+    try:
+        vecdir = os.path.join(reg, "data", "experimental-speed-projection")
+        os.makedirs(vecdir, exist_ok=True)
+        vec_path = write_test_gguf(
+            os.path.join(vecdir, "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"),
+            {"general.architecture": "qwen4exp"}, [f"direction.{i}" for i in range(48)])
+        vec_rel = "data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
+        other_vec = write_test_gguf(os.path.join(vecdir, "Some-Other-Model-vector.gguf"),
+                                    {"general.architecture": "llama"},
+                                    [f"direction.{i}" for i in range(32)])
+        not_vec = write_test_gguf(os.path.join(reg, "not-a-vector.gguf"),
+                                  {"general.architecture": "qwen4exp", "qwen4exp.block_count": 48},
+                                  ["token_embd.weight", "output.weight"])
+        model_gguf = os.path.join(reg, "qwen38.gguf")
+        write_test_gguf(model_gguf, {"general.architecture": "qwen4exp", "qwen4exp.block_count": 48},
+                        ["tok_embeddings.weight"])
+        bad_gguf = os.path.join(reg, "bad.gguf")
+        with open(bad_gguf, "wb") as fh:
+            fh.write(b"NOT A GGUF AT ALL")
+
+        # --- юнит-часть cvec.py
+        check("fmt_scale как у setup (1.0/0.5/-0.8)",
+              cv.fmt_scale(1.0) == "1.0" and cv.fmt_scale(0.5) == "0.5"
+              and cv.fmt_scale(-0.8) == "-0.8")
+        check("GGUF: слои вектора читаются (0..47)",
+              cv.control_vector_layers(vec_path) == list(range(48)))
+        check("GGUF: другой вектор - 32 слоя",
+              cv.control_vector_layers(other_vec) == list(range(32)))
+        check("GGUF: без direction.* -> [] (не вектор)",
+              cv.control_vector_layers(not_vec) == [])
+        check("GGUF: block_count модели читается (meta-only)",
+              cv.model_layer_count(not_vec) == 48)
+        check("не-GGUF -> None (не роняет)", cv.control_vector_layers(bad_gguf) is None)
+
+        base_args = ["--model", model_gguf, "--max-context", "128000",
+                     "--control-vector-scaled", "OLD/path.gguf:1.0",
+                     "--control-vector-layer-range", "4", "44",
+                     "--cvec-mode", "project", "--cvec-dir", "per-layer"]
+        stripped = cv.strip_cvec_args(base_args)
+        check("strip: ВСЕ cvec-флаги с их значениями убраны, остальное цело",
+              stripped == ["--model", model_gguf, "--max-context", "128000"], str(stripped))
+        built = cv.build_cvec_args(vec_path, 1.0, "project", "per-layer", 12, "manual", 4, 44, [], True)
+        check("build (strata, вручную 4..44): канонический порядок setup.py",
+              built == ["--control-vector-scaled", f"{vec_path}:1.0",
+                        "--control-vector-layer-range", "4", "44",
+                        "--cvec-mode", "project", "--cvec-dir", "per-layer"], str(built))
+        built2 = cv.build_cvec_args(vec_path, 0.5, "add", "single", 7, "all", 0, 0,
+                                    [(other_vec, 0.25)], True)
+        check("build: «все слои» + single:L + доп.вектор (складываются)",
+              built2 == ["--control-vector-scaled", f"{vec_path}:0.5",
+                         "--control-vector-scaled", f"{other_vec}:0.25",
+                         "--cvec-mode", "add", "--cvec-dir", "single:7"], str(built2))
+        built3 = cv.build_cvec_args(vec_path, 1.0, "project", "per-layer", 0, "manual", 4, 44, [], False)
+        check("build (сток llama.cpp): только базовые флаги, без cvec-mode/cvec-dir",
+              built3 == ["--control-vector-scaled", f"{vec_path}:1.0",
+                         "--control-vector-layer-range", "4", "44"], str(built3))
+        found = cv.scan_control_vectors([reg], force=True)
+        check("скан: векторы найдены (относительные пути), не-вектор и мусор отсеяны",
+              set(found) == {vec_rel, "data/experimental-speed-projection/Some-Other-Model-vector.gguf"}
+              and found[vec_rel] == vec_path, str(found))
+        live = cv.parse_live_cvec("project:4-44:12")
+        check("parse_live_cvec: project:4-44:12",
+              live == {"mode": "project", "start": 4, "end": 44, "single": 12})
+        check("live-сверка: совпадает/не совпадает/нет вектора",
+              cv.live_cvec_matches(live, {"mode": "project", "start": 4, "end": 44, "single": 12})
+              and not cv.live_cvec_matches(live, {"mode": "add", "start": 4, "end": 44, "single": 12})
+              and not cv.parse_live_cvec(0))
+
+        # --- реестр с диска: база с УЖЕ установленными setup-флагами ESP
+        base_cfg = {"exe": os.path.join(reg, "strata.exe"), "args": list(base_args),
+                    "cwd": reg, "tokenizer": os.path.join(reg, "tokenizer"),
+                    "model_name": "qwen3.8-flash-next-iq3_s",
+                    "display_name": "Qwen3.8 Flash Next",
+                    "log": os.path.join(reg, "strata-qwen38.log"),
+                    "aliases": ["qwen-flash"], "port": 8080}
+        base_config = os.path.join(reg, "strata-qwen3.8.json")
+        with open(base_config, "w", encoding="utf-8") as fh:
+            json.dump(base_cfg, fh, indent=1)
+        base_bytes = open(base_config, "rb").read()
+
+        BASE_ID, VAR_ID = "qwen3.8-flash-next-iq3_s", "qwen3.8-flash-next-iq3_s-cvec"
+        var_path = os.path.join(reg, "strata-qwen3.8-cvec.json")
+        ST.registry_dir, ST.current, ST.cvec_info = reg, BASE_ID, None
+        ST.load_calls.clear()
+        node = nodes_mod.PolyStrataControlVector()
+
+        def _kw(**over):
+            kw = {"server": server, "model": BASE_ID, "enabled": True, "vector": vec_rel,
+                  "vector_manual": "", "scale": 1.0, "mode": "project", "dir_mode": "per-layer",
+                  "single_layer": 12, "layer_range": nodes_mod.CVEC_LAYERS_MANUAL,
+                  "layer_start": 4, "layer_end": 44, "scan_root": "", "extra_vectors": "",
+                  "engine_profile": nodes_mod.CVEC_PROFILES[0], "requests_default": True,
+                  "switch_now": True, "variant_suffix": "cvec", "force_reload": False}
+            kw.update(over)
+            return kw
+
+        out, _ = capture(node.run, **_kw())
+        check("run: вариант создан, сервер переключён на него (ОДНА загрузка)",
+              ST.load_calls == [{"path": "/api/models/load", "model": VAR_ID}], str(ST.load_calls))
+        check("run: базовый конфиг НЕ тронут (байты те же)",
+              open(base_config, "rb").read() == base_bytes)
+        vcfg = json.loads(open(var_path, encoding="utf-8-sig").read())
+        check("вариант: setup-флаги базы ЗАМЕНЕНЫ настройками ноды",
+              vcfg["args"] == ["--model", model_gguf, "--max-context", "128000"] + built,
+              str(vcfg["args"]))
+        check("вариант: model_name/display_name/лог свои, aliases сняты, sampling, маркер",
+              vcfg["model_name"] == VAR_ID and vcfg["display_name"] == "Qwen3.8 Flash Next + cvec"
+              and vcfg["log"].endswith("strata-qwen38-cvec.log") and "aliases" not in vcfg
+              and vcfg["sampling"]["experimental_speed_projection"] is True
+              and cv.is_our_variant(vcfg))
+        check("run: движок подтвердил вектор (СОВПАДАЕТ - мок вывел из конфига варианта)",
+              "СОВПАДАЕТ" in out["result"][0])
+
+        ST.load_calls.clear()
+        out, _ = capture(node.run, **_kw())
+        check("повторный запуск: no-op (переключений нет, файл не пишется)",
+              not ST.load_calls and "уже активен" in out["result"][0]
+              and "без записи" in out["result"][0])
+
+        ST.load_calls.clear()
+        out, _ = capture(node.run, **_kw(scale=0.8))
+        check("смена параметров при АКТИВНОМ варианте: рестарт через базу (2 загрузки)",
+              ST.load_calls == [{"path": "/api/models/load", "model": BASE_ID},
+                                {"path": "/api/models/load", "model": VAR_ID}], str(ST.load_calls))
+        check("вариант перезаписан: скейл 0.8",
+              f"{vec_path}:0.8" in json.loads(open(var_path, encoding="utf-8-sig").read())["args"])
+
+        ST.load_calls.clear()
+        out, _ = capture(node.run, **_kw(scale=0.9, switch_now=False))
+        check("switch_now=False: конфиг записан, сервер не трогается",
+              not ST.load_calls and "активация" in out["result"][0])
+        check("вариант: скейл 0.9",
+              f"{vec_path}:0.9" in json.loads(open(var_path, encoding="utf-8-sig").read())["args"])
+
+        ST.load_calls.clear()
+        out, _ = capture(node.run, **_kw(force_reload=True))
+        check("force_reload: рестарт через базу даже без изменений",
+              len(ST.load_calls) == 2 and ST.load_calls[0]["model"] == BASE_ID)
+
+        out, _ = capture(node.run, **_kw(
+            vector="data/experimental-speed-projection/Some-Other-Model-vector.gguf", layer_end=60))
+        check("предупреждения: чужой вектор + диапазон шире вектора и модели",
+              "ДРУГОЙ модели" in out["result"][0] and "шире слоёв вектора" in out["result"][0]
+              and "числа слоёв модели" in out["result"][0], out["result"][0][:300])
+
+        out, _ = capture(node.run, **_kw(engine_profile=nodes_mod.CVEC_PROFILES[2], switch_now=False))
+        vcfg = json.loads(open(var_path, encoding="utf-8-sig").read())
+        check("сток-профиль llama.cpp: cvec-mode/cvec-dir не пишутся + предупреждение",
+              "--cvec-mode" not in vcfg["args"] and "--cvec-dir" not in vcfg["args"]
+              and "llama.cpp" in out["result"][0])
+
+        out, _ = capture(node.run, **_kw(vector="", vector_manual=vec_rel, switch_now=False))
+        check("vector_manual: относительный путь резолвится по корням скана",
+              f"{vec_path}:1.0" in json.loads(open(var_path, encoding="utf-8-sig").read())["args"])
+
+        out, _ = capture(node.run, **_kw(switch_now=False,
+                                          extra_vectors=f"{other_vec}:0.25\n{vec_rel}:0.5"))
+        vcfg = json.loads(open(var_path, encoding="utf-8-sig").read())
+        check("extra_vectors: доп. --control-vector-scaled складываются",
+              vcfg["args"].count("--control-vector-scaled") == 3
+              and f"{other_vec}:0.25" in vcfg["args"] and f"{vec_path}:0.5" in vcfg["args"])
+
+        os.remove(var_path)
+        with open(var_path, "w", encoding="utf-8") as fh:      # ЧУЖОЙ файл без маркера
+            json.dump({"exe": "some.exe", "args": ["--model", "x.gguf"]}, fh)
+        check("чужой файл на месте варианта: отказ, не перезаписываем",
+              _try(lambda: capture(node.run, **_kw(switch_now=False))))
+        os.remove(var_path)
+
+        capture(node.run, **_kw())                # вернуть «свой» вариант (и активировать)
+        ST.load_calls.clear()
+        out, _ = capture(node.run, **_kw(enabled=False))
+        check("disable: сервер на базу + файл варианта удалён",
+              ST.load_calls == [{"path": "/api/models/load", "model": BASE_ID}]
+              and not os.path.exists(var_path) and ST.current == BASE_ID)
+        out, _ = capture(node.run, **_kw(enabled=False))
+        check("disable повторно: нечего удалять (no-op)", "нечего удалять" in out["result"][0])
+
+        check("модель не из реестра: понятная ошибка",
+              _try(lambda: capture(node.run, **_kw(model="no-such-model"))))
+        check("вектор не найден: понятная ошибка",
+              _try(lambda: capture(node.run, **_kw(vector="(векторы не найдены - укажите путь в vector_manual)",
+                                                   vector_manual=""))))
+
+        # --- дропдауны и замороженный порядок виджетов
+        nodes_mod.mark_server_active(server)
+        nodes_mod._MODEL_LIST_CACHE.clear()
+        cv._SCAN_CACHE.clear()
+        opts = nodes_mod._cvec_model_options()
+        check("дропдаун model: id реестра, БЕЗ сентинела «как на сервере»",
+              BASE_ID in opts and nodes_mod.MODEL_SWITCH_OFF not in opts, str(opts))
+        vopts = nodes_mod._cvec_vector_options()
+        check("дропдаун vector: векторы автоскана (пути от корня)", vec_rel in vopts, str(vopts)[:200])
+        it = nodes_mod.PolyStrataControlVector.INPUT_TYPES()
+        order = list(it["required"]) + list(it["optional"])
+        check("порядок виджетов cvec-ноды заморожен с v0.10.0 (новые - только в конец!)",
+              order == ["server", "model", "enabled", "vector", "vector_manual", "scale", "mode",
+                        "dir_mode", "single_layer", "layer_range", "layer_start", "layer_end",
+                        "scan_root", "extra_vectors", "engine_profile", "requests_default",
+                        "switch_now", "variant_suffix", "force_reload"], str(order))
+        check("OUTPUT_NODE + выход status (исполняется без связей)",
+              nodes_mod.PolyStrataControlVector.OUTPUT_NODE is True
+              and nodes_mod.PolyStrataControlVector.RETURN_TYPES == ("STRING",))
+
+        js2_path = os.path.join(PACK_DIR, "js", "polystrata_cvec.js")
+        js2 = open(js2_path, encoding="utf-8").read() if os.path.isfile(js2_path) else ""
+        check("js/polystrata_cvec.js: существует, NODE_KEY синхронен, виджеты по именам",
+              bool(js2) and '"PolyStrataControlVector"' in js2
+              and '"dir_mode"' in js2 and '"layer_range"' in js2 and '"vector_manual"' in js2)
+        check("js: скрытие косметическое (hidden/computeSize), хук beforeRegisterNodeDef",
+              "w.hidden" in js2 and "computeSize" in js2 and "beforeRegisterNodeDef" in js2)
+    finally:
+        ST.registry_dir, ST.cvec_info = None, None
+        ST.current = "gemma-4-26b-a4b"
+        ST.load_calls.clear()
+        _sh.rmtree(reg, ignore_errors=True)
 
     # ---------- итог ----------
     print(f"\n{'=' * 60}")

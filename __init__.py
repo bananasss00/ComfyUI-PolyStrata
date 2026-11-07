@@ -50,6 +50,15 @@ llama.cpp-нод) - ComfyUI грузит свои модели без OOM.
 На ComfyUI без comfy_api нода Chat автоматически собирается в V1-варианте (входы images/videos
 фиксированные) - поведение то же.
 
+Control vector (v0.10.0): опциональная нода PolyStrataControlVector - «поведенческий» GGUF-вектор
+(направления по слоям) для модели. Флаги движка (--control-vector-scaled/--cvec-mode/--cvec-dir/
+--control-vector-layer-range) - СТАРТОВЫЕ: /api/models/load перечитывает конфиг только при
+переключении на ДРУГУЮ запись реестра, поэтому нода пишет рядом с базовым конфигом ВАРИАНТ
+strata-<id>-<suffix>.json (клон + вектора) и переключает сервер на него штатным hot-swap'ом.
+Базовый конфиг не трогается; выключение - enabled=False (файл удаляется). Per-request
+выключатель уже вектора на движке: extra_sampling {"experimental_speed_projection": false}
+в ноде Sampling. Новая нода - отдельный класс, старые воркфлоу не затрагивает.
+
 Важно: elastic VRAM у strata-poly ВСТРОЕН (движок 0.1.45-poly.6+, обновление - UPDATE.bat).
 Ключ "vram_elastic": true в конфиге strata-poly-модели ВРЕДЕН (движок падает на неизвестном
 флаге --vram-elastic) - не добавляйте его, а если добавляли, удалите.
@@ -85,6 +94,13 @@ except ImportError:
         sys.modules["ps_client"] = _mod
         _spec.loader.exec_module(_mod)
 
+    # cvec.py (GGUF-вектора, вариант-конфиги) - тот же приём, до загрузки nodes.py
+    if "cvec" not in sys.modules:
+        _spec = importlib.util.spec_from_file_location("cvec", os.path.join(_dir, "cvec.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        sys.modules["cvec"] = _mod
+        _spec.loader.exec_module(_mod)
+
     _nodes = _load("nodes", os.path.join(_dir, "nodes.py"))
     NODE_CLASS_MAPPINGS = _nodes.NODE_CLASS_MAPPINGS
     NODE_DISPLAY_NAME_MAPPINGS = _nodes.NODE_DISPLAY_NAME_MAPPINGS
@@ -95,4 +111,4 @@ __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 # ComfyUI раздаёт содержимое ./js на /extensions/<имя пакета>/... и импортирует его как ES-модуль.
 WEB_DIRECTORY = "./js"
 
-__version__ = "0.9.1"
+__version__ = "0.10.0"

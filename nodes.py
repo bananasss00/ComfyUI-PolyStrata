@@ -33,6 +33,16 @@
                         запусками. Без него Chat работает одиночным запросом.
   PolyStrata Unload   - полная выгрузка модели (POST /v1/unload). Сквозная. Возвращает
                         ComfyUI исходное EXTRA_RESERVED_VRAM (бронь снимается).
+  PolyStrata Control Vector (v0.10.0) - опциональная нода «поведенческого» вектора
+                        (control vector, GGUF ~0.5 МБ с направлениями по слоям):
+                        пишет РЯДОМ с базовым конфигом вариант strata-<id>-<suffix>.json
+                        (клон + флаги --control-vector-scaled/--cvec-mode/--cvec-dir/
+                        --control-vector-layer-range) и переключает сервер на него штатным
+                        hot-swap'ом (POST /api/models/load перечитывает конфиг с диска
+                        только при переключении на ДРУГУЮ запись реестра - поэтому вариант
+                        и сделан отдельной моделью). Базовый конфиг не трогается; откат -
+                        enabled=False (удалить вариант) или удалить файл руками. Запускной
+                        математики в ноде нет: слои/скейл - виджеты (cvec.py).
 
 Компактность (v0.8.0): у нод НЕТ виджетов api_key/extra_mib и медиа-лимитов - доступ
 localhost, резерв - один reserve_mib, лимиты кадров - в опциональной субноде Media
@@ -84,6 +94,11 @@ try:
     from .ps_client import PolyStrataClient, PolyStrataError
 except ImportError:                      # загрузка не как пакет (старый загрузчик ComfyUI)
     from ps_client import PolyStrataClient, PolyStrataError
+
+try:
+    from . import cvec as _cvec
+except ImportError:                      # старый загрузчик: cvec регистрирует __init__.py
+    import cvec as _cvec
 
 # ---------------------------------------------------------------------------
 # Schema V3 (comfy_api.latest) - как в llama.cpp-нодах. Если ComfyUI старый и
@@ -1831,6 +1846,511 @@ class PolyStrataUnload:
         return {"ui": {"text": [msg]}, "result": (any_input,)}
 
 
+# ================================================================ нода: Control Vector
+# Control vector - СТАРТОВЫЕ флаги движка в конфиге модели (см. cvec.py: там же
+# проверка по исходникам сервера, ПОЧЕМУ вариант-конфиг, а не правка базового).
+CVEC_NO_MODELS = "(сервер недоступен - запустите PolyStrata и обновите F5/R)"
+CVEC_NO_VECTORS = "(векторы не найдены - укажите путь в vector_manual)"
+
+CVEC_LAYERS_ALL = "все слои (как в файле вектора)"
+CVEC_LAYERS_MANUAL = "вручную (start..end включительно)"
+CVEC_PROFILES = ["auto (по exe конфига)", "strata (все флаги)", "llama.cpp (только базовые флаги)"]
+
+CVEC_SERVER_TOOLTIP = ("Адрес сервера PolyStrata (IP:порт, как у остальных нод). Нода читает\n"
+                       "реестр моделей (GET /api/models), пишет вариант-конфиг РЯДОМ с базовым\n"
+                       "strata-<модель>.json (папка конфигов сервера) и переключает сервер\n"
+                       "(POST /api/models/load). ВАЖНО: ComfyUI должен видеть эту папку по\n"
+                       "локальному пути - сервер на ДРУГОЙ машине не поддерживается (конфиги\n"
+                       "правятся по файловой системе, удалённого API для этого у сервера нет).")
+
+CVEC_MODEL_TOOLTIP = ("Базовая модель (id из GET /api/models). Нода НЕ меняет её конфиг: рядом\n"
+                      "пишется клон strata-<id>-<suffix>.json с векторными флагами - реестр сервера\n"
+                      "видит его как ОТДЕЛЬНУЮ модель. Сменили параметры - при следующем запуске\n"
+                      "воркфлоу вариант перезапишется. Выбор здесь варианта (тот же id с суффиксом)\n"
+                      "эквивалентен выбору его базовой модели. Список обновляется F5/R (кеш 15 c).")
+
+CVEC_ENABLED_TOOLTIP = ("True - записать/обновить вариант и (при switch_now) включить его на сервере.\n"
+                        "False - УДАЛИТЬ вариант-конфиг (сервер предварительно возвращается на базовую\n"
+                        "модель, если был на варианте). Базовый конфиг не трогается никогда.")
+
+CVEC_VECTOR_TOOLTIP = ("GGUF-файл контрольного вектора (тензоры direction.<N>, обычно ~0.5 МБ).\n"
+                       "Список - автоскан папки конфигов сервера (+ data/, + scan_root, + переменная\n"
+                       "POLYSTRATA_CVEC_DIR): каждый небольшой GGUF с direction-тензорами; показ -\n"
+                       "путь относительно корня скана. Обновляется F5/R. Вектор ОБЫЧНО обучен под\n"
+                       "КОНКРЕТНУЮ модель - для чужой модели это шум (нода предупредит, если имена\n"
+                       "не пересекаются).")
+
+CVEC_VECTOR_MANUAL_TOOLTIP = ("Путь к вектору вручную (перекрывает дропдаун, если не пусто):\n"
+                              "абсолютный или относительно папки конфигов сервера. Для векторов вне\n"
+                              "папок скана - например C:\\vectors\\my.gguf.")
+
+CVEC_SCALE_TOOLTIP = ("Сила вектора в --control-vector-scaled <файл>:<скейл>.\n"
+                      "project: 1.0 = срезать проекцию ЦЕЛИКОМ (штат поставки Strata), <1 - частично,\n"
+                      ">1 - с перегибом; знак положительный. add: обычно ±0.05..0.15, «подавить» =\n"
+                      "отрицательный. Стоковый llama.cpp без патча - всегда аддитивный режим.")
+
+CVEC_MODE_TOOLTIP = ("--cvec-mode: как вектор действует на активации. project (патч Strata/пакета\n"
+                     "вектора): h -= s*(h.v)*v - вычитает проекцию на направление; в ~7 раз меньше\n"
+                     "дрейфа на остальное. add (сток llama.cpp): h += s*v - просто прибавляет.\n"
+                     "Флаг - патч движка Strata: профиль llama.cpp его не пишет (режим аддитивный).")
+
+CVEC_DIR_TOOLTIP = ("--cvec-dir: как читать направления из файла. per-layer - свой вектор на каждый\n"
+                    "слой (рекомендуется, файл так и устроен). single - одно направление слоя L на\n"
+                    "все слои диапазона (--cvec-dir single:<L>; в чужих тестах лишь 6-16% эффекта).")
+
+CVEC_SINGLE_LAYER_TOOLTIP = ("Слой L для --cvec-dir single:<L> (используется только при dir_mode=single).")
+
+CVEC_LAYER_RANGE_TOOLTIP = ("--control-vector-layer-range start end (включительно). «Все слои» - флаг не\n"
+                            "пишется, движок применяет вектор ко всем слоям из файла. Поставки Strata\n"
+                            "использует 4..44 из 48: крайние слои не трогают (первые - низкоуровневые\n"
+                            "признаки, последние формируют следующий токен) - эффект чуть слабее, зато\n"
+                            "качество выше. Для ДРУГИХ моделей своё число слоёв - нода предупредит,\n"
+                            "если диапазон выйдет за пределы файла или модели.")
+
+CVEC_SCAN_ROOT_TOOLTIP = ("Доп. папка для автоскана векторов (векторами считаются только GGUF с\n"
+                          "тензорами direction.<N> не больше 256 МБ; модели-«тяжеловесы» не вскрываются).\n"
+                          "Пусто - папка конфигов сервера + её data/ + POLYSTRATA_CVEC_DIR.")
+
+CVEC_EXTRA_VECTORS_TOOLTIP = ("Дополнительные векторы, «путь:скейл» по одному в строке (или через запятую):\n"
+                              "пути абсолютные или относительно папок скана. Каждый - ещё один\n"
+                              "--control-vector-scaled; эффекты векторов СКЛАДЫВАЮТСЯ. Диапазон слоёв\n"
+                              "и режим - общие для всех. Пусто - один вектор из vector/vector_manual.")
+
+CVEC_PROFILE_TOOLTIP = ("Какие флаги писать. auto: exe с «strata» в имени -> все (движок Strata\n"
+                        "понимает --cvec-mode/--cvec-dir, патч пакета вектора); иначе - только стоковые\n"
+                        "llama.cpp-флаги --control-vector-scaled + --control-vector-layer-range\n"
+                        "(в стоке вектор всегда аддитивный, а для архитектуры qwen4exp сток его\n"
+                        "МОЛЧА игнорирует). Явно - переопределить догадку.")
+
+CVEC_REQUESTS_DEFAULT_TOOLTIP = ("Умолчание для ЗАПРОСОВ, не указавших поле (пишется в sampling-блок\n"
+                                 "варианта: experimental_speed_projection). True - вектор применяется\n"
+                                 "всегда; выключить ОДИН запрос можно extra_sampling\n"
+                                 "{\"experimental_speed_projection\": false} в ноде Sampling. False -\n"
+                                 "наоборот: включать точечно тем же полем со значением true.")
+
+CVEC_SWITCH_NOW_TOOLTIP = ("Переключить сервер на вариант сразу (штатный hot-swap: текущий движок\n"
+                           "останавливается, вариант грузится по своему конфигу; первый старт - минуты).\n"
+                           "Каждый запуск воркфлоу ГАРАНТИРУЕТ состояние: вариант активен (если кто-то\n"
+                           "переключил сервер вручную - нода вернёт). Если вариант уже активен и файл не\n"
+                           "менялся - ничего не перезагружает (проверка дешёвая). Изменили параметры при\n"
+                           "АКТИВНОМ варианте - перезапуск через базовую модель (2 загрузки подряд;\n"
+                           "дешевле менять параметры, пока активна базовая). False - только записать\n"
+                           "конфиг; включить можно в дропдауне model ноды Chat (F5/R подхватит список).")
+
+CVEC_SUFFIX_TOOLTIP = ("Суффикс варианта: файл strata-<конфиг-базы>-<суффикс>.json, модель в реестре -\n"
+                       "<id базы>-<суффикс>. Несколько вариантов одной модели (разные векторы/скейлы) -\n"
+                       "разные суффиксы в нескольких таких нодах. Прежние варианты с другими суффиксами\n"
+                       "нода не удаляет (управляет только «своим»).")
+
+CVEC_FORCE_TOOLTIP = ("Перегрузить вариант принудительно (если подозреваете, что движок работает не с\n"
+                      "теми параметрами: сервер перезапускали, конфиг правили руками). Иначе нода\n"
+                      "перезапускает движок только когда файл варианта изменился.")
+
+
+def _cvec_auto_roots() -> list:
+    """Корни автоскана векторов: папка конфигов каждого известного сервера
+    (127.0.0.1:8080 + ACTIVE_SERVERS, как дропдаун model) + её data/ + env."""
+    servers = {"127.0.0.1:8080"}
+    with _AUTO_LOCK:
+        servers.update(s.removeprefix("http://") for s in ACTIVE_SERVERS)
+    roots: list = []
+    for s in sorted(servers):
+        try:
+            resp = PolyStrataClient(s).models()
+        except PolyStrataError:
+            continue
+        for e in (resp or {}).get("models") or []:
+            c = str(e.get("config") or "")
+            if c:
+                d = Path(c).parent
+                roots += [str(d), str(d / "data")]
+    roots.extend(_cvec.env_roots())
+    seen, out = set(), []
+    for r in roots:
+        if r and r.lower() not in seen:
+            seen.add(r.lower())
+            out.append(r)
+    return out
+
+
+def _cvec_model_options() -> list:
+    """Дропдаун model: id установленных моделей (без сентинела «как на сервере»:
+    базе нужна определённость). Сервер недоступен - заглушка (нода честно упадёт)."""
+    ids = [m for m in _model_combo_options() if m != MODEL_SWITCH_OFF]
+    return ids or [CVEC_NO_MODELS]
+
+
+def _cvec_vector_options() -> list:
+    """Дропдаун vector: найденные автосканом GGUF-векторы (пути от корня скана)."""
+    try:
+        found = _cvec.scan_control_vectors(_cvec_auto_roots())
+    except Exception as e:                       # скан не должен ронять построение схемы
+        print(f"[PolyStrata] cvec: автоскан не удался ({e})", flush=True)
+        found = {}
+    return list(found.keys()) or [CVEC_NO_VECTORS]
+
+
+def _cvec_find_entry(entries: list, name: str):
+    """Запись реестра по id / имени конфига / стему / уникальному вхождению
+    (как registry.find сервера: точные совпадения приоритетнее подстроки)."""
+    want = str(name or "").strip()
+    if not want or want == CVEC_NO_MODELS:
+        return None
+    low = want.lower()
+    for e in entries:
+        if low in (str(e.get("id") or "").lower(),
+                   Path(str(e.get("config") or "")).name.lower(),
+                   Path(str(e.get("config") or "")).stem.lower()):
+            return e
+    close = [e for e in entries if low in str(e.get("id") or "").lower()]
+    return close[0] if len(close) == 1 else None
+
+
+def _cvec_name_tokens(*parts) -> set:
+    """Смысловые куски имён (латиница/цифры, >=4 символов) для мягкой проверки
+    «вектор обучен под эту модель?»."""
+    out = set()
+    for p in parts:
+        for t in re.split(r"[^A-Za-z0-9]+", str(p or "").lower()):
+            if len(t) >= 4:
+                out.add(t)
+    return out
+
+
+class PolyStrataControlVector:
+    """Опциональная нода «поведенческого» control vector для сервера PolyStrata.
+
+    Механика (проверено по serve/server.py; см. cvec.py): флаги вектора -
+    СТАРТОВЫЕ параметры движка в strata-<модель>.json, а POST /api/models/load
+    перечитывает конфиг с диска только при переключении на ДРУГУЮ запись реестра
+    (для текущей модели load() - no-op, unload+load рестартит со СТАРОЙ командной
+    строкой). Поэтому нода пишет РЯДОМ с базовым конфигом ВАРИАНТ
+    strata-<id>-<suffix>.json - клон базы + векторные флаги, свой model_name - и
+    переключает сервер на него штатным hot-swap'ом. Базовый конфиг не меняется:
+    включить/выключить = переключиться между базой и вариантом; полностью убрать
+    = enabled=False (файл варианта удаляется).
+
+    Выход status - человекочитаемый отчёт (что записано/переключено/предупреждения).
+    OUTPUT_NODE: исполняется при каждом запуске воркфлоу даже без связей; повторный
+    запуск при том же состоянии - дешёвый no-op (сверка конфига, без перезагрузок).
+
+    Порядок виджетов - контракт сохранённых воркфлоу (инвариант 17 AGENTS.md):
+    с v0.10.0 заморожен; новые виджеты - только в КОНЕЦ.
+    """
+
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "server": ("STRING", {"default": "127.0.0.1:8080", "tooltip": CVEC_SERVER_TOOLTIP}),
+                "model": (_cvec_model_options(), {"tooltip": CVEC_MODEL_TOOLTIP}),
+                "enabled": ("BOOLEAN", {"default": True, "tooltip": CVEC_ENABLED_TOOLTIP}),
+                "vector": (_cvec_vector_options(), {"tooltip": CVEC_VECTOR_TOOLTIP}),
+                "vector_manual": ("STRING", {"default": "", "tooltip": CVEC_VECTOR_MANUAL_TOOLTIP}),
+                "scale": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05,
+                                    "tooltip": CVEC_SCALE_TOOLTIP}),
+                "mode": (["project", "add"], {"default": "project", "tooltip": CVEC_MODE_TOOLTIP}),
+                "dir_mode": (["per-layer", "single"], {"default": "per-layer",
+                                                       "tooltip": CVEC_DIR_TOOLTIP}),
+                "single_layer": ("INT", {"default": 12, "min": 0, "max": 1023, "step": 1,
+                                         "tooltip": CVEC_SINGLE_LAYER_TOOLTIP}),
+                "layer_range": ([CVEC_LAYERS_ALL, CVEC_LAYERS_MANUAL],
+                                {"default": CVEC_LAYERS_ALL, "tooltip": CVEC_LAYER_RANGE_TOOLTIP}),
+                "layer_start": ("INT", {"default": 4, "min": 0, "max": 1023, "step": 1,
+                                        "tooltip": "Начало диапазона слоёв (layer_range = вручную)."}),
+                "layer_end": ("INT", {"default": 44, "min": 0, "max": 1023, "step": 1,
+                                      "tooltip": "Конец диапазона слоёв, включительно "
+                                                 "(layer_range = вручную)."}),
+            },
+            "optional": {
+                "scan_root": ("STRING", {"default": "", "tooltip": CVEC_SCAN_ROOT_TOOLTIP}),
+                "extra_vectors": ("STRING", {"multiline": True, "default": "",
+                                             "tooltip": CVEC_EXTRA_VECTORS_TOOLTIP}),
+                "engine_profile": (CVEC_PROFILES, {"default": CVEC_PROFILES[0],
+                                                   "tooltip": CVEC_PROFILE_TOOLTIP}),
+                "requests_default": ("BOOLEAN", {"default": True,
+                                                 "tooltip": CVEC_REQUESTS_DEFAULT_TOOLTIP}),
+                "switch_now": ("BOOLEAN", {"default": True, "tooltip": CVEC_SWITCH_NOW_TOOLTIP}),
+                "variant_suffix": ("STRING", {"default": "cvec", "tooltip": CVEC_SUFFIX_TOOLTIP}),
+                "force_reload": ("BOOLEAN", {"default": False, "tooltip": CVEC_FORCE_TOOLTIP}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status",)
+    FUNCTION = "run"
+    CATEGORY = "PolyStrata"
+    DESCRIPTION = ("Control vector (GGUF с направлениями по слоям) для модели PolyStrata: "
+                   "вариант-конфиг strata-<id>-cvec.json рядом с базовым + переключение "
+                   "сервера на него (hot-swap). Базовый конфиг не трогается; выключение - "
+                   "enabled=False. Выход status - отчёт. Вектор действует на ВСЕ запросы "
+                   "пока активен; per-request выключатель - extra_sampling "
+                   "{\"experimental_speed_projection\": false} в ноде Sampling.")
+
+    # ------------------------------------------------------------------ исполнение
+    def run(self, **kw):
+        kw = _scalars(kw)                    # инвариант 15: листы на любых входах
+        server = str(kw.get("server") or "127.0.0.1:8080")
+        model = str(kw.get("model") or "").strip()
+        enabled = bool(kw.get("enabled"))
+        vector_sel = str(kw.get("vector") or "").strip()
+        vector_manual = str(kw.get("vector_manual") or "").strip()
+        scale = float(kw.get("scale") if kw.get("scale") is not None else 1.0)
+        mode = str(kw.get("mode") or "project")
+        dir_mode = str(kw.get("dir_mode") or "per-layer")
+        single_layer = int(kw.get("single_layer") or 0)
+        layer_range = str(kw.get("layer_range") or CVEC_LAYERS_ALL)
+        layer_start = int(kw.get("layer_start") if kw.get("layer_start") is not None else 4)
+        layer_end = int(kw.get("layer_end") if kw.get("layer_end") is not None else 44)
+        scan_root = str(kw.get("scan_root") or "").strip()
+        extra_text = str(kw.get("extra_vectors") or "")
+        profile = str(kw.get("engine_profile") or CVEC_PROFILES[0])
+        requests_default = bool(kw.get("requests_default"))
+        switch_now = bool(kw.get("switch_now"))
+        suffix = str(kw.get("variant_suffix") or "cvec")
+        force_reload = bool(kw.get("force_reload"))
+
+        manual_range = layer_range == CVEC_LAYERS_MANUAL
+        if manual_range and layer_end < layer_start:
+            raise PolyStrataError(f"cvec: диапазон слоёв перепутан ({layer_start} > {layer_end}).")
+
+        client = PolyStrataClient(server)
+        entries = (client.models() or {}).get("models") or []
+        entry = _cvec_find_entry(entries, model)
+        if entry is None:
+            ids = ", ".join(str(e.get("id")) for e in entries) or "пусто"
+            raise PolyStrataError(f"cvec: модель '{model or CVEC_NO_MODELS}' не найдена в реестре "
+                                  f"сервера. Доступны: {ids}. Обновите список (F5/R).")
+
+        # --- конфиг базы: локальный путь (сервер и ComfyUI на одной машине)
+        def _abs_cfg(e) -> Path:
+            p = Path(str(e.get("config") or ""))
+            return p if p.is_absolute() else (Path.cwd() / p)
+
+        base_config = _abs_cfg(entry)
+        if not base_config.is_file():
+            raise PolyStrataError(
+                f"cvec: конфиг модели недоступен локально: {base_config}. Нода пишет вариант-конфиг "
+                f"рядом с базовым по файловой системе - ComfyUI должен работать на той же машине, "
+                f"что и сервер PolyStrata (сервер вернул '{entry.get('config')}').")
+        try:
+            base_cfg = _cvec.load_config(base_config)
+        except (OSError, ValueError) as e:
+            raise PolyStrataError(f"cvec: базовый конфиг не читается ({base_config}): {e}") from e
+
+        # выбрали сам вариант - работаем с его базой (marker 'of')
+        if _cvec.is_our_variant(base_cfg):
+            of = str((base_cfg.get(_cvec.CVEC_MARKER) or {}).get("of") or "").strip()
+            base_entry = _cvec_find_entry(entries, of) if of else None
+            if base_entry is None:
+                raise PolyStrataError(f"cvec: у выбранного варианта нет базовой модели '{of}' "
+                                      f"в реестре - восстановите конфиг базы или выберите её.")
+            entry, base_config = base_entry, _abs_cfg(base_entry)
+            if not base_config.is_file():
+                raise PolyStrataError(f"cvec: конфиг базы недоступен локально: {base_config}.")
+            try:
+                base_cfg = _cvec.load_config(base_config)
+            except (OSError, ValueError) as e:
+                raise PolyStrataError(f"cvec: конфиг базы не читается ({base_config}): {e}") from e
+        base_id = str(entry.get("id") or base_config.stem)
+
+        var_path, sfx = _cvec.variant_paths(base_config, suffix)
+        variant_id = f"{base_id}-{sfx}"
+
+        # ---------------------------------------------------------------- выключение
+        if not enabled:
+            return self._run_disable(client, base_id, var_path, variant_id)
+
+        # ---------------------------------------------------------------- корни скана
+        roots = [str(base_config.parent), str(base_config.parent / "data")]
+        cwd = str(base_cfg.get("cwd") or "").strip()
+        if cwd:
+            roots.append(cwd)
+            roots.append(str(Path(cwd) / "data"))
+        if scan_root:
+            roots.insert(0, scan_root)
+        roots.extend(_cvec.env_roots())
+
+        # ---------------------------------------------------------------- вектор
+        warns: list = []
+        vec_value = vector_manual or ("" if vector_sel == CVEC_NO_VECTORS else vector_sel)
+        vec_path = _cvec.resolve_vector_path(vec_value, roots) if vec_value else None
+        if vec_path is None or not vec_path.is_file():
+            hint = (f"Искали: абсолютный путь или относительно {'; '.join(roots[:6])}"
+                    f"{'; ...' if len(roots) > 6 else ''}.")
+            raise PolyStrataError(f"cvec: файл вектора не найден ('{vec_value or 'не задан'}'). {hint}")
+        layers = _cvec.control_vector_layers(vec_path)
+
+        # --- мягкие проверки «применимо ли к этой модели»
+        if layers is None:
+            warns.append(f"GGUF-вектора не разобран ({vec_path.name}) - путь передаётся движку как есть.")
+        elif not layers:
+            warns.append(f"в {vec_path.name} нет тензоров direction.<N> - это не похоже на control "
+                         f"vector; движок откажется стартовать, сервер вернёт прежнюю модель.")
+        else:
+            span = f"{layers[0]}..{layers[-1]} ({len(layers)} шт.)"
+            if manual_range:
+                bad = [x for x in (layer_start, layer_end) if x < layers[0] or x > layers[-1]]
+                if bad:
+                    warns.append(f"диапазон {layer_start}..{layer_end} шире слоёв вектора ({span}).")
+            elif layers[0] == 0 and layers[-1] >= 7:
+                warns.append(f"вектор покрывает все слои 0..{layers[-1]}; поставки Strata режут "
+                             f"крайние (для 48-слойной Qwen3.8: 4..44) - чуть слабее, но чище.")
+        model_path = str(entry.get("path") or "")
+        model_layers = _cvec.model_layer_count(model_path) if model_path else None
+        if model_layers and manual_range and layer_end >= model_layers:
+            warns.append(f"конец диапазона ({layer_end}) >= числа слоёв модели ({model_layers}).")
+        if not (_cvec_name_tokens(vec_path.stem) & _cvec_name_tokens(base_id,
+                                                                    entry.get("display_name"))):
+            warns.append(f"имя вектора ({vec_path.stem}) не пересекается с моделью ({base_id}) - "
+                         f"вектор, судя по всему, обучен для ДРУГОЙ модели.")
+
+        # --- профиль движка: какие флаги писать
+        if profile.startswith("strata"):
+            strata_engine = True
+        elif profile.startswith("llama"):
+            strata_engine = False
+        else:
+            strata_engine = "strata" in Path(str(base_cfg.get("exe") or "")).name.lower()
+        if not strata_engine:
+            warns.append("профиль llama.cpp: --cvec-mode/--cvec-dir не пишутся (патч Strata); "
+                         "вектор будет аддитивным, а для qwen4exp сток МОЛЧА его игнорирует.")
+            if mode == "project":
+                warns.append("mode=project в стоке не поддерживается - движок применит вектор "
+                             "аддитивно (add).")
+
+        extra_vecs, extra_warns = _cvec.parse_extra_vectors(extra_text, roots)
+        warns += extra_warns
+
+        args = _cvec.build_cvec_args(vec_path, scale, mode, dir_mode, single_layer,
+                                      "manual" if manual_range else "all",
+                                      layer_start, layer_end, extra_vecs, strata_engine)
+
+        # ---------------------------------------------------------------- вариант-конфиг
+        if var_path.exists():
+            try:
+                existing = _cvec.load_config(var_path)
+            except (OSError, ValueError):
+                existing = None
+            if existing is not None and not _cvec.is_our_variant(existing):
+                raise PolyStrataError(f"cvec: {var_path.name} уже существует и создан НЕ этой нодой "
+                                      f"(нет маркера) - не трогаю. Возьмите другой variant_suffix.")
+
+        new_cfg = _cvec.variant_config(base_cfg, base_id, args, sfx, requests_default)
+        changed = _cvec.write_config_if_changed(var_path, new_cfg)
+        wrote = f"записан {var_path.name}" if changed else "конфиг варианта актуален (без записи)"
+
+        # --- реестр должен увидеть вариант (валидность: exe/токенизатор/файл модели)
+        resp2 = client.models() or {}
+        models2 = resp2.get("models") or []
+        var_entry = next((e for e in models2 if str(e.get("id") or "") == variant_id), None)
+        if var_entry is None:
+            raise PolyStrataError(
+                f"cvec: сервер НЕ видит вариант {variant_id} (GET /api/models). Реестр молча "
+                f"пропускает невалидные конфиги: проверьте логику (exe/args/файл модели) и лог "
+                f"сервера; файл оставлен: {var_path}.")
+        if var_entry.get("status") == "unavailable":
+            raise PolyStrataError(f"cvec: вариант {variant_id} недоступен: {var_entry.get('problem')}.")
+        current = str(resp2.get("current") or "")
+
+        # ---------------------------------------------------------------- переключение
+        notes = [f"вариант {variant_id}: {wrote}"]
+        if switch_now:
+            if current == variant_id:
+                if changed or force_reload:
+                    print(f"[PolyStrata] cvec: параметры изменились при активном варианте - "
+                          f"перезапуск через базовую модель ({base_id}), 2 загрузки", flush=True)
+                    _ensure_model(client, base_id)
+                    _ensure_model(client, variant_id)
+                    notes.append("движок перезапущен через базу (2 загрузки)")
+                else:
+                    notes.append("вариант уже активен - перезапуск не нужен")
+            else:
+                _ensure_model(client, variant_id)
+                notes.append("сервер переключён на вариант (движок читает конфиг с диска)")
+            notes.append(self._live_note(client, strata_engine, mode, manual_range,
+                                         layer_start, layer_end, dir_mode, single_layer))
+        else:
+            notes.append("активация: switch_now=True, либо модель "
+                         f"'{variant_id}' в дропдауне ноды Chat (после F5/R)")
+        if warns:
+            notes += [f"ВНИМАНИЕ: {w}" for w in warns]
+        notes.append("per-request выключатель (движок не перезагружается): extra_sampling "
+                     "{\"experimental_speed_projection\": false} в ноде Sampling")
+        msg = "\n".join(notes)
+        print(f"[PolyStrata] cvec:\n{msg}", flush=True)
+        return {"ui": {"text": [msg]}, "result": (msg,)}
+
+    # ------------------------------------------------------------------ вспомогательные
+    def _live_note(self, client, strata_engine, mode, manual_range,
+                   layer_start, layer_end, dir_mode, single_layer) -> str:
+        """Сверка engine.cvec из GET /metrics с желаемым (только текст: рестарты
+        решаются по changed/force_reload, чтобы не зациклиться на движках без
+        INFO-патча, которые всегда отвечают cvec=0)."""
+        try:
+            raw = ((client.metrics() or {}).get("engine") or {}).get("cvec")
+        except PolyStrataError:
+            return "состояние движка неизвестно (нет /metrics или старый сервер)"
+        live = _cvec.parse_live_cvec(raw)
+        if live is None:
+            return ("движок НЕ отчитался о векторе (cvec=0). Возможные причины: старый движок "
+                    "без патча, стоковый llama.cpp или вектор не загрузился - проверьте лог "
+                    "сервера; если движок точно с патчем - force_reload.")
+        desired = {"mode": mode if strata_engine else "add",
+                   "start": layer_start if manual_range else None,
+                   "end": layer_end if manual_range else None,
+                   "single": single_layer if str(dir_mode) != "per-layer" else None}
+        ok = _cvec.live_cvec_matches(live, desired)
+        parts = [f"mode={live.get('mode')}"]
+        if live.get("start") is not None:
+            parts.append(f"слои {live.get('start')}-{live.get('end')}")
+        if live.get("single") is not None:
+            parts.append(f"single={live.get('single')}")
+        verdict = "СОВПАДАЕТ с настройками" if ok else "отличается от настроек (см. выше)"
+        return "движок: control vector " + ", ".join(parts) + " - " + verdict
+
+    def _run_disable(self, client: PolyStrataClient, base_id: str,
+                     var_path: Path, variant_id: str):
+        """enabled=False: вернуть сервер на базу (если он на варианте) и удалить файл."""
+        lines = []
+        if var_path.exists():
+            try:
+                existing = _cvec.load_config(var_path)
+                ours = _cvec.is_our_variant(existing)
+            except (OSError, ValueError):
+                ours = False
+            if not ours:
+                lines.append(f"{var_path.name} существует, но создан НЕ этой нодой - не трогаю.")
+                msg = "\n".join(lines)
+                print(f"[PolyStrata] cvec (disable):\n{msg}", flush=True)
+                return {"ui": {"text": [msg]}, "result": (msg,)}
+            try:
+                current = str((client.models() or {}).get("current") or "")
+            except PolyStrataError as e:
+                current = ""
+                lines.append(f"состояние сервера не узнать ({e}) - файл всё равно удаляю.")
+            if current == variant_id:
+                try:
+                    _ensure_model(client, base_id)
+                    lines.append(f"сервер возвращён на базовую модель '{base_id}'.")
+                except PolyStrataError as e:
+                    lines.append(f"вернуть базу '{base_id}' не удалось ({e}); сервер останется "
+                                 f"на варианте до следующего переключения.")
+            try:
+                var_path.unlink()
+                lines.append(f"вариант удалён: {var_path.name}.")
+            except OSError as e:
+                lines.append(f"удалить {var_path.name} не удалось ({e}) - удалите руками.")
+        else:
+            lines.append("вариант-конфиг не найден - нечего удалять.")
+        lines.append("Базовый конфиг эта нода никогда не меняет.")
+        msg = "\n".join(lines)
+        print(f"[PolyStrata] cvec (disable):\n{msg}", flush=True)
+        return {"ui": {"text": [msg]}, "result": (msg,)}
+
+
 # ================================================================ регистрация
 NODE_CLASS_MAPPINGS = {
     "PolyStrataChat": PolyStrataChat,
@@ -1838,6 +2358,7 @@ NODE_CLASS_MAPPINGS = {
     "PolyStrataMedia": PolyStrataMedia,
     "PolyStrataMemory": PolyStrataMemory,
     "PolyStrataUnload": PolyStrataUnload,
+    "PolyStrataControlVector": PolyStrataControlVector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1846,6 +2367,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PolyStrataMedia": "PolyStrata Media",
     "PolyStrataMemory": "PolyStrata Memory",
     "PolyStrataUnload": "PolyStrata Unload (полная выгрузка)",
+    "PolyStrataControlVector": "PolyStrata Control Vector (поведенческий вектор)",
 }
 
 # Авто-выгрузка модели (механика llama.cpp-нод): хуки на каждый запуск воркфлоу и на

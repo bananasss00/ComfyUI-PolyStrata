@@ -14,10 +14,12 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 
 | Файл | Роль |
 | --- | --- |
-| `nodes.py` | Все ноды: `PolyStrataChat`, `PolyStrataSampling`, `PolyStrataMedia`, `PolyStrataMemory`, `PolyStrataUnload` + `NODE_CLASS_MAPPINGS`. Тултипы на русском, там же - основная документация виджетов. В Chat - тоггл `clear_comfy_vram` (очистка памяти моделей ComfyUI перед генерацией, один раз на запуск воркфлоу), обработка листов на входах: универсальный `_scalars` по всему kwargs (без перечисления имён) + `_as_pins`, и виджет `model` (v0.9.0: дропдаун установленных моделей сервера - `_model_combo_options()`/`_server_model_ids`, кеш 15 c; сентинел `как на сервере` - не влиять; другая модель - `_ensure_model` переключает сервер ДО генерации). Виджетов api_key/extra_mib и медиа-лимитов в Chat НЕТ: лимиты кадров - в субноде `PolyStrataMedia`, `top_k` - в чате после `top_p`. |
+| `nodes.py` | Все ноды: `PolyStrataChat`, `PolyStrataSampling`, `PolyStrataMedia`, `PolyStrataMemory`, `PolyStrataUnload`, `PolyStrataControlVector` + `NODE_CLASS_MAPPINGS`. Тултипы на русском, там же - основная документация виджетов. В Chat - тоггл `clear_comfy_vram` (очистка памяти моделей ComfyUI перед генерацией, один раз на запуск воркфлоу), обработка листов на входах: универсальный `_scalars` по всему kwargs (без перечисления имён) + `_as_pins`, и виджет `model` (v0.9.0: дропдаун установленных моделей сервера - `_model_combo_options()`/`_server_model_ids`, кеш 15 c; сентинел `как на сервере` - не влиять; другая модель - `_ensure_model` переключает сервер ДО генерации). Виджетов api_key/extra_mib и медиа-лимитов в Chat НЕТ: лимиты кадров - в субноде `PolyStrataMedia`, `top_k` - в чате после `top_p`. Нода `PolyStrataControlVector` (v0.10.0, класс без comfy_api): виджеты в порядке инварианта 17 (порядок заморожен, тест сверяет); исполнение = `_scalars` → реестр → вариант-конфиг через `_cvec` → `_ensure_model` для переключений. |
+| `cvec.py` | Движковая логика ноды Control Vector (без HTTP): GGUF-заголовок (слои вектора `direction.<N>`, `block_count` модели), сборка/вычистка cvec-флагов (`CVEC_FLAG_ARITY` - арности!), скан папок на векторы (ТТЛ-кеш, ≤256 МБ), вариант-конфиг (клон базы + флаги + `model_name`/`display_name`/свой лог/без aliases + `sampling.experimental_speed_projection` + маркер `cvec_variant`), атомарная запись (tmp + os.replace). Причина «варианта, а не правки базы» - в докстринге модуля (проверено по serve/server.py). |
 | `ps_client.py` | Тонкий HTTP-клиент (`PolyStrataClient`): chat/vram/unload/status/props/models/switch_model/load, разбор ошибок (409 model_busy, 503+Retry-After, 400 --vram-elastic, 404 no model named, 422 битый конфиг, 503 при переключении; код ответа - атрибут `.status` исключения), interruptible-запросы (`stop_check` - колбэк Cancel ComfyUI, при срабатывании соединение закрывается). |
 | `__init__.py` | Загрузка двумя способами (package-спека и старый загрузчик ComfyUI без package-контекста). Версия пакета - здесь (`__version__`). `WEB_DIRECTORY = "./js"` - раздаёт JS-расширение фронтенда. |
 | `js/polystrata_migration.js` | JS-расширение (ES-модуль, `import { app } from "../../scripts/app.js"`): миграция СТАРЫХ ВОРКФЛОУ при загрузке - `beforeRegisterNodeDef` оборачивает `nodeType.prototype.configure`, и ДО раскладки `widgets_values` по виджетам старый формат переписывается в текущий (таблица `MIGRATIONS`; детекция по якорю reasoning+max_tokens, НЕ по длине массива). `MODEL_SENTINEL` там = `MODEL_SWITCH_OFF` из nodes.py - синхронность проверяет тест. Подробнее - README «Совместимость воркфлоу (миграция)». |
+| `js/polystrata_cvec.js` | JS-расширение для ноды Control Vector: КОСМЕТИКА - прячет неактуальные виджеты (`single_layer`/`layer_start`/`layer_end`/`vector`) через `widget.hidden` + подмену `computeSize` (порядок виджетов НЕ меняется - сериализация не затрагивается, миграций не требует). Имена виджетов и NODE_KEY синхронны с nodes.py (проверяет тест). |
 | `tests/test_nodepack.py` | Портативный тест-харнесс: поднимает mock-сервер PolyStrata (форматы из `serve/server.py` и `docs/VRAM_ELASTIC.md`) и прогоняет все ноды. Запуск: `python tests/test_nodepack.py` (или `python3 scripts/test_nodepack.py` из workspace). |
 | `worklog.md` | Журнал изменений с обоснованиями - дополняется при каждом изменении поведения. |
 | `README.md` | Пользовательская документация (RU). |
@@ -126,12 +128,41 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
     (`MODEL_SENTINEL`) обязан совпадать с `MODEL_SWITCH_OFF` в nodes.py - проверяет
     тест. Встроенное в ComfyUI: настройка «Restore widget values by name»
     (Comfy.Workflow.NamedValuesRestore) и NodeReplace (переименование КЛАССА ноды)
-    наши случаи не закрывают - миграция живёт в нодпаке.
+    наши случаи не закрывают - миграция живёт в нодпаке. Порядок виджетов
+    `PolyStrataControlVector` заморожен с v0.10.0 - тест пакета сверяет точный
+    список имён (изменил - как для Chat: MIGRATIONS/README/тест).
+18. **Control vector - только вариант-конфиг, базу не править.** Флаги
+    `--control-vector-scaled`/`--cvec-mode`/`--cvec-dir`/`--control-vector-layer-range`
+    - СТАРТОВЫЕ аргументы движка; `POST /api/models/load` перечитывает конфиг с
+    диска ТОЛЬКО при переключении на другую запись реестра (для текущей - no-op,
+    unload+load рестартит со старой командной строкой - проверено по serve/server.py).
+    Нода пишет `strata-<id>-<suffix>.json`-клон, базовый конфиг setup'а не трогает
+    ВООБЩЕ. Перезапись/удаление - только файлов с маркером `cvec_variant` (чужой
+    файл на месте варианта = отказ). Арности флагов при вычистке - таблица
+    `CVEC_FLAG_ARITY` в cvec.py (значение, похожее на `--`, не съедается).
+    Перезапуск при АКТИВНОМ варианте - только через базу (2 загрузки), НЕ
+    unload+load. Per-request выключатель - поле тела `experimental_speed_projection`
+    (уже проходит через `extra_sampling`), НЕ рестарт.
 
 ## Проверенные факты об API PolyStrata (обновляй по репозиторию сервера)
 
 Источник истины - репозиторий VecSzn/PolyStrata:
 
+- **Control vector (проверено по исходникам, 2026-11-07)**: флаги пишет setup.py
+  (~L8682: `["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range",
+  "4", "44", "--cvec-mode", "project", "--cvec-dir", "per-layer"]`); вектор поставки -
+  `data/experimental-speed-projection/` (480 КБ, docs/DETAILS.md «Experimental speed
+  projection»: лог движка `control vector mode = project, dir = per-layer, layers
+  4..44 (41 steered)`). `GET /metrics` → `engine.cvec` = `project:4-44[:singleL]` |
+  `add:A-B` | `0` (serve/web/app.js projectionText; JSON по умолчанию - Prometheus-текст
+  только с Accept: text/plain или ?format=prometheus, serve/prometheus.py wants_prometheus).
+  Per-request: топ-левел тело `"experimental_speed_projection": false` (OpenAI и
+  Anthropic; SHARED_KEYS; конфиг-умолчание - `"sampling"`-блок; движок без вектора
+  ключ игнорирует; отсутствует = включён). Реестр (serve/models.py describe): валиден
+  конфиг с `exe` + `args`-списком, неизвестные ключи игнорируются - маркер
+  `cvec_variant` безвреден; `display_name` конфига перекрывает GGUF-шный; невалидные
+  конфиги реестр ПРОПУСКАЕТ МОЛЧА (нода проверяет это повторным GET /api/models).
+  GGUF-векторы: тензоры `direction.<N>`; слои моделей - KV `<arch>.block_count`.
 - **Сэмплинг**: `serve/server.py` → `check_request_sampling` (~L7511: типы и алиасы
   `repeat_penalty→repetition_penalty`, `repeat_last_n→penalty_last_n`) и
   `StrataEngine.sampling_keys` (~L1203: что реально уходит движку: temperature, top_p,

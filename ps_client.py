@@ -424,6 +424,15 @@ class PolyStrataClient:
         """GET /props - свойства сервера (default_generation_settings.n_ctx, chat_template ...)."""
         return self._request("GET", "/props", timeout=self.timeouts["quick"])
 
+    def metrics(self) -> dict:
+        """GET /metrics (JSON; текстовый формат Prometheus отдаётся только с Accept:
+        text/plain или ?format=prometheus - serve/prometheus.py wants_prometheus).
+        Метрики сервера и СЕЧЕНИЕ ДВИЖКА (engine = {..., **engine.info}), в т.ч.
+        engine.cvec - загруженный control vector: 'project:4-44[:singleL]' | 'add:A-B'
+        | 0 (нет). Нужен ноде Control Vector для подтверждения, что движок поднялся
+        с вектором. Старый сервер без /metrics - PolyStrataError 404."""
+        return self._request("GET", "/metrics", timeout=self.timeouts["quick"])
+
     # ------------------------------------------------------------------ смена модели
     def models(self, timeout=None) -> dict:
         """GET /api/models - УСТАНОВЛЕННЫЕ модели сервера (реестр strata-*.json в корне
