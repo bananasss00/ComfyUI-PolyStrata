@@ -32,6 +32,14 @@ http.client, при срабатывании stop_check сокет закрыв�
 PolyStrata (_watch_client) видит EOF и отменяет генерацию движка
 (comfy.model_management.throw_exception_if_processing_interrupted поллится во время запроса;
 InterruptProcessingException наследует BaseException и не глотается).
+
+Совместимость воркфлоу (v0.9.1): JSON графа хранит значения виджетов ПОЗИЦИОННО
+(nodes[].widgets_values), поэтому вставка виджета model в v0.9.0 сдвинула значения
+нижележащих виджетов в старых воркфлоу. Миграция - js/polystrata_migration.js
+(WEB_DIRECTORY): хук beforeRegisterNodeDef оборачивает configure, и ПЕРЕД раскладкой
+значений по виджетам старый формат v0.8.x переписывается в текущий (детекция по якорю
+reasoning+max_tokens, не по длине; сентинел в JS синхронен MODEL_SWITCH_OFF - проверяет
+тест). Новые виджеты впредь добавляются В КОНЕЦ списка входов (AGENTS.md, инвариант 17).
 Sampling - остальной сэмплинг: top_k, min_p, штрафы, stop, logit_bias (запрет токенов),
 extra_sampling (JSON-сквозняк на будущие поля движка).
 Memory - история. Unload - полная выгрузка, сквозная; возвращает ComfyUI исходное
@@ -82,4 +90,9 @@ except ImportError:
     NODE_DISPLAY_NAME_MAPPINGS = _nodes.NODE_DISPLAY_NAME_MAPPINGS
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
-__version__ = "0.9.0"
+
+# JS-расширение фронтенда (миграция старых воркфлоу, см. README «Совместимость воркфлоу»):
+# ComfyUI раздаёт содержимое ./js на /extensions/<имя пакета>/... и импортирует его как ES-модуль.
+WEB_DIRECTORY = "./js"
+
+__version__ = "0.9.1"

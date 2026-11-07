@@ -16,7 +16,8 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
 | --- | --- |
 | `nodes.py` | Все ноды: `PolyStrataChat`, `PolyStrataSampling`, `PolyStrataMedia`, `PolyStrataMemory`, `PolyStrataUnload` + `NODE_CLASS_MAPPINGS`. Тултипы на русском, там же - основная документация виджетов. В Chat - тоггл `clear_comfy_vram` (очистка памяти моделей ComfyUI перед генерацией, один раз на запуск воркфлоу), обработка листов на входах: универсальный `_scalars` по всему kwargs (без перечисления имён) + `_as_pins`, и виджет `model` (v0.9.0: дропдаун установленных моделей сервера - `_model_combo_options()`/`_server_model_ids`, кеш 15 c; сентинел `как на сервере` - не влиять; другая модель - `_ensure_model` переключает сервер ДО генерации). Виджетов api_key/extra_mib и медиа-лимитов в Chat НЕТ: лимиты кадров - в субноде `PolyStrataMedia`, `top_k` - в чате после `top_p`. |
 | `ps_client.py` | Тонкий HTTP-клиент (`PolyStrataClient`): chat/vram/unload/status/props/models/switch_model/load, разбор ошибок (409 model_busy, 503+Retry-After, 400 --vram-elastic, 404 no model named, 422 битый конфиг, 503 при переключении; код ответа - атрибут `.status` исключения), interruptible-запросы (`stop_check` - колбэк Cancel ComfyUI, при срабатывании соединение закрывается). |
-| `__init__.py` | Загрузка двумя способами (package-спека и старый загрузчик ComfyUI без package-контекста). Версия пакета - здесь (`__version__`). |
+| `__init__.py` | Загрузка двумя способами (package-спека и старый загрузчик ComfyUI без package-контекста). Версия пакета - здесь (`__version__`). `WEB_DIRECTORY = "./js"` - раздаёт JS-расширение фронтенда. |
+| `js/polystrata_migration.js` | JS-расширение (ES-модуль, `import { app } from "../../scripts/app.js"`): миграция СТАРЫХ ВОРКФЛОУ при загрузке - `beforeRegisterNodeDef` оборачивает `nodeType.prototype.configure`, и ДО раскладки `widgets_values` по виджетам старый формат переписывается в текущий (таблица `MIGRATIONS`; детекция по якорю reasoning+max_tokens, НЕ по длине массива). `MODEL_SENTINEL` там = `MODEL_SWITCH_OFF` из nodes.py - синхронность проверяет тест. Подробнее - README «Совместимость воркфлоу (миграция)». |
 | `tests/test_nodepack.py` | Портативный тест-харнесс: поднимает mock-сервер PolyStrata (форматы из `serve/server.py` и `docs/VRAM_ELASTIC.md`) и прогоняет все ноды. Запуск: `python tests/test_nodepack.py` (или `python3 scripts/test_nodepack.py` из workspace). |
 | `worklog.md` | Журнал изменений с обоснованиями - дополняется при каждом изменении поведения. |
 | `README.md` | Пользовательская документация (RU). |
@@ -110,6 +111,22 @@ ComfyUI custom nodes для локального сервера [PolyStrata](htt
     параметр оставлен внутренним). Лимиты кадров - субнода `PolyStrataMedia` (тип
     PS_MEDIA, без сентинелов), `top_k` - виджет чата после `top_p` (-1 = умолчание
     сервера, клиент не шлёт <=0).
+    ИСКЛЮЧЕНИЕ из «model НЕТ» - v0.9.0: в Chat ЕСТЬ виджет model (дропдаун сервера,
+    сентинел `как на сервере`, переключение ДО генерации - `_ensure_model`);
+    строка выше описывает отсутствие model в ЗАПРОСЕ при сентинеле.
+17. **Порядок виджетов = контракт сохранённых воркфлоу.** `nodes[].widgets_values`
+    в JSON графа ПОЗИЦИОННЫЕ: вставка/удаление виджета в середине списка входов
+    сдвигает значения всех виджетов ниже (у пользователя враги воркфлоу ломаются).
+    Правила: (а) новые виджеты добавлять В КОНЕЦ списка входов define_schema/
+    INPUT_TYPES - старые воркфлоу грузятся без миграции, новому виджету достанется
+    дефолт; (б) если вставка/удаление/переименование в середине НЕИЗБЕЖНЫ - запись
+    в `MIGRATIONS` в `js/polystrata_migration.js` (detect по содержимым якорям,
+    НЕ по длине массива - сериализация seed/control_after_generate зависит от
+    фронтенда) + строка в README «Совместимость воркфлоу»; (в) сентинел в JS
+    (`MODEL_SENTINEL`) обязан совпадать с `MODEL_SWITCH_OFF` в nodes.py - проверяет
+    тест. Встроенное в ComfyUI: настройка «Restore widget values by name»
+    (Comfy.Workflow.NamedValuesRestore) и NodeReplace (переименование КЛАССА ноды)
+    наши случаи не закрывают - миграция живёт в нодпаке.
 
 ## Проверенные факты об API PolyStrata (обновляй по репозиторию сервера)
 

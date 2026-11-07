@@ -38,6 +38,13 @@ model_management.unload_all_models выгружает всё наблюдаем�
 к которому нодпак ни разу не обращался, не трогается (им может пользоваться Jan/curl).
 
 Запуск: python3 tests/test_nodepack.py   (или scripts/test_nodepack.py из workspace)
+
+МИГРАЦИЯ СТАРЫХ ВОРКФЛОУ (v0.9.1): widgets_values в JSON графа ПОЗИЦИОННЫЕ, вставка
+model в v0.9.0 сдвигала нижележащие значения; лечит js/polystrata_migration.js
+(beforeRegisterNodeDef оборачивает configure; детекция по якорю reasoning+max_tokens,
+не по длине). Секция [12] проверяет синхронность сентинела JS<->nodes.py и порождающий
+тест: макет из актуальной схемы минус model == синтетический v0.8.x, якорная
+миграция обязана собрать его обратно.
 """
 import base64
 import contextlib
@@ -492,7 +499,7 @@ def main():
     check("NODE_CLASS_MAPPINGS (старый загрузчик)", set(pack2.NODE_CLASS_MAPPINGS) == expected)
     check("нод Load/VRAM больше нет",
           not any(k for k in pack.NODE_CLASS_MAPPINGS if "Load" in k or "Vram" in k))
-    check("версия 0.9.0", getattr(pack, "__version__", "") == "0.9.0")
+    check("версия 0.9.1", getattr(pack, "__version__", "") == "0.9.1")
 
     samp_node = nodes_mod.PolyStrataSampling()
     mem_node = nodes_mod.PolyStrataMemory()
@@ -1318,6 +1325,69 @@ def main():
     check("контекст недоступен в status -> берётся из /props",
           nodes_mod._server_ctx(ps(server, "")) == 16384)
     ST.ctx_n, ST.props_ctx = 32768, 0
+
+    # ---------- 12. миграция старых воркфлоу (v0.9.1) ----------
+    print("\n[12] Миграция старых воркфлоу: js/polystrata_migration.js")
+    js_path = os.path.join(PACK_DIR, "js", "polystrata_migration.js")
+    check("WEB_DIRECTORY = './js' (JS-расширение раздаётся фронтенду)",
+          getattr(pack, "WEB_DIRECTORY", "") == "./js")
+    check("файл js/polystrata_migration.js существует", os.path.isfile(js_path), js_path)
+    js = ""
+    if os.path.isfile(js_path):
+        with open(js_path, encoding="utf-8") as fh:
+            js = fh.read()
+    check("сентинел в JS = MODEL_SWITCH_OFF из nodes.py (синхронность)",
+          bool(nodes_mod.MODEL_SWITCH_OFF) and f'"{nodes_mod.MODEL_SWITCH_OFF}"' in js)
+    check("хук beforeRegisterNodeDef + обёртка prototype.configure",
+          "beforeRegisterNodeDef" in js and "prototype.configure" in js)
+    check("таблица MIGRATIONS накрывает PolyStrataChat",
+          "PolyStrataChat:" in js and "MIGRATIONS" in js)
+    check("детекция по якорю reasoning+max_tokens (НЕ по длине массива)",
+          "reasoningAnchor" in js and "REASONING_OPTIONS" in js)
+    check("объектная форма widgets_values обрабатывается", "Array.isArray" in js)
+
+    # Порождающий тест: макет виджетов Chat из АКТУАЛЬНОЙ схемы; убираем значение
+    # model -> синтетический «воркфлоу v0.8.x»; якорная миграция (та же логика,
+    # что в JS) обязана собрать его обратно с сентинелом после server.
+    widget_names = [i.name for i in schema["inputs"]
+                    if i.kind != "autogrow" and "type_id" not in getattr(i, "kw", {})]
+    check("макет виджетов Chat ожидаемый (изменился - дополни MIGRATIONS в JS!)",
+          widget_names == ["server", "model", "prompt", "system_prompt_preset",
+                           "system_prompt_text", "reasoning", "max_tokens", "temperature",
+                           "top_p", "top_k", "seed", "reserve_mib", "clear_comfy_vram"],
+          str(widget_names))
+    by_widget = {"server": "127.0.0.1:8080", "model": nodes_mod.MODEL_SWITCH_OFF,
+                 "prompt": "Опиши картинку", "system_prompt_preset": "none",
+                 "system_prompt_text": "", "reasoning": "default",
+                 "max_tokens": 1024, "temperature": 0.8, "top_p": 0.95,
+                 "top_k": -1, "seed": 12345, "reserve_mib": 800,
+                 "clear_comfy_vram": False}
+
+    def _anchor(v):
+        opts = ("default", "none", "low", "medium", "high")
+        for i in range(1, len(v) - 1):
+            if v[i] in opts and isinstance(v[i + 1], (int, float)) \
+                    and not isinstance(v[i + 1], bool):
+                return i
+        return -1
+
+    def _roundtrip(with_control):
+        cur = [by_widget[n] for n in widget_names]
+        if with_control:   # control_after_generate отдельным элементом после seed
+            cur.insert(widget_names.index("seed") + 1, "fixed")
+        old = list(cur)
+        old.pop(1)                             # v0.8.x: значения model не было вовсе
+        migrated = list(old)
+        if _anchor(migrated) == 4:             # v0.8.x: reasoning на позиции 4
+            migrated.insert(1, nodes_mod.MODEL_SWITCH_OFF)
+        return migrated == cur and _anchor(cur) == 5
+
+    check("v0.8.x-массив мигрирует: сентинел вторым, хвост не сдвигается",
+          _roundtrip(False))
+    check("то же при control_after_generate отдельным элементом после seed",
+          _roundtrip(True))
+    check("актуальный формат узнаётся (якорь на 5) - миграция не трогает",
+          _anchor([by_widget[n] for n in widget_names]) == 5)
 
     # ---------- итог ----------
     print(f"\n{'=' * 60}")
